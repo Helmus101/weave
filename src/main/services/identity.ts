@@ -6,26 +6,33 @@ export class IdentityService {
   private queue: any[] = [];
   private processingQueue = false;
   private readonly BATCH_SIZE = 20;
+  private stopped = false;
 
   processNewContacts(rawNodes: any[]) {
-    if (rawNodes.length === 0) return;
+    if (this.stopped || rawNodes.length === 0) return;
     this.queue.push(...rawNodes.filter((node) => node?.subtype === "contact"));
     if (!this.processingQueue) {
       void this.processQueue();
     }
   }
 
+  stop() {
+    this.stopped = true;
+    this.queue = [];
+  }
+
   private async processQueue() {
     this.processingQueue = true;
     try {
+      if (this.stopped) return;
       console.log(`[Identity] Processing ${this.queue.length} queued contacts for merging...`);
-      const peopleNodes = this.db.getMemoryNodes("SEMANTIC").filter(n => n.subtype === "person");
-      const rawNodesSnapshot = this.db.getMemoryNodes("RAW");
+      const peopleNodes = this.db.getMemoryNodesByLayerAndSubtype("SEMANTIC", "person");
 
-      while (this.queue.length > 0) {
+      while (!this.stopped && this.queue.length > 0) {
         const batch = this.queue.splice(0, this.BATCH_SIZE);
         for (const raw of batch) {
-          await this.processOneContact(raw, peopleNodes, rawNodesSnapshot);
+          if (this.stopped) break;
+          await this.processOneContact(raw, peopleNodes);
         }
         await this.yieldToEventLoop();
       }
@@ -34,8 +41,9 @@ export class IdentityService {
     }
   }
 
-  private async processOneContact(raw: any, peopleNodes: any[], rawNodesSnapshot: any[]) {
+  private async processOneContact(raw: any, peopleNodes: any[]) {
     try {
+      if (this.stopped) return;
       if (raw.subtype !== "contact") return;
       
       const meta = raw.metadata || {};
@@ -83,8 +91,8 @@ export class IdentityService {
         }
 
         if (this.shouldRefreshEnrichment(match.metadata?.enrichmentUpdatedAt)) {
-          await this.localEnrichment(match.id, match.title, mergedEmails, rawNodesSnapshot);
-          void this.research.enrichPerson(match.id, match.title);
+          await this.localEnrichment(match.id, match.title, mergedEmails);
+          if (!this.stopped) void this.research.enrichPerson(match.id, match.title);
         }
       } else {
         // Create new person profile node.
@@ -105,15 +113,16 @@ export class IdentityService {
         peopleNodes.push(this.db.getMemoryNode(newPersonId)!);
         
         // Enrich with local and external data.
-        await this.localEnrichment(newPersonId, raw.title, rawEmails, rawNodesSnapshot);
-        void this.research.enrichPerson(newPersonId, raw.title);
+        await this.localEnrichment(newPersonId, raw.title, rawEmails);
+        if (!this.stopped) void this.research.enrichPerson(newPersonId, raw.title);
       }
     } catch (e) {
       console.error("[Identity] Failed processing contact:", e);
     }
   }
 
-  private async localEnrichment(personId: string, personName: string, emails: string[], rawNodesSnapshot: any[]) {
+  private async localEnrichment(personId: string, personName: string, emails: string[]) {
+    if (this.stopped) return;
     const person = this.db.getMemoryNode(personId);
     if (!person) return;
     
@@ -123,10 +132,7 @@ export class IdentityService {
         this.normalizeName(personName)
       ].filter(Boolean)));
 
-      const rawNodes = rawNodesSnapshot.filter(n => {
-        const text = (n.canonicalText || "").toLowerCase();
-        return keywords.some((k) => text.includes(k));
-      }).slice(0, 80);
+      const rawNodes = this.db.searchRawNodesByKeywords(keywords, 80);
 
       const edges = this.db.getMemoryEdges(personId);
       const linkedNodeIds = Array.from(new Set(edges.map((edge) => edge.fromId === personId ? edge.toId : edge.fromId).filter((id) => id !== personId)));

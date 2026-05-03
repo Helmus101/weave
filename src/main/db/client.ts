@@ -30,14 +30,13 @@ export interface MemoryNodeInput {
 type SqlValue = string | number | null;
 type SqlRow = Record<string, SqlValue>;
 
-const defaultBlacklist = [
-  "1Password", "com.1password", "Bitwarden", "com.bitwarden", "KeePass",
-  "Bank", "banking", "Wallet", "Authenticator"
-];
-
 export class WeaveDatabase {
   private ftsDisabled = false;
   private ftsFallbackLogged = false;
+  private batchDepth = 0;
+  private dirty = false;
+  private kvMemory = new Map<string, any>();
+  private kvLoaded = new Set<string>();
 
   private constructor(private sqlite: initSqlJs.Database, private dbPath: string) {}
 
@@ -91,7 +90,7 @@ export class WeaveDatabase {
         createdAt
       ]
     );
-    this.persist();
+    this.persistIfNeeded();
     return id;
   }
 
@@ -106,6 +105,27 @@ export class WeaveDatabase {
       ocrHash: optionalString(row.ocr_hash),
       createdAt: stringValue(row.created_at)
     }));
+  }
+
+  getEvent(id: string) {
+    const row = this.one(`SELECT * FROM events WHERE id = ?`, [id]);
+    if (!row) return undefined;
+    return {
+      id: stringValue(row.id),
+      type: stringValue(row.type),
+      timestamp: stringValue(row.timestamp),
+      source: stringValue(row.source),
+      text: optionalString(row.text),
+      metadata: safeJson(stringValue(row.metadata), {}),
+      ocrHash: optionalString(row.ocr_hash),
+      createdAt: stringValue(row.created_at)
+    };
+  }
+
+  getEventsByIds(ids: string[]) {
+    const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+    if (uniqueIds.length === 0) return [];
+    return uniqueIds.map((id) => this.getEvent(id)).filter(Boolean);
   }
 
   getRecentEventsBySource(source: string, limit = 100): any[] {
@@ -159,7 +179,7 @@ export class WeaveDatabase {
       `INSERT OR REPLACE INTO core_identity (key, value, updated_at) VALUES (?, ?, ?)`,
       [key, JSON.stringify(value), now]
     );
-    this.persist();
+    this.persistIfNeeded();
   }
 
   getCoreIdentity(): Record<string, any> {
@@ -179,8 +199,8 @@ export class WeaveDatabase {
     this.run(
       `INSERT INTO memory_nodes (
         id, layer, subtype, title, summary, canonical_text, confidence, 
-        status, importance, last_reheated, anchor_at, metadata, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        status, source_refs, importance, last_reheated, anchor_at, metadata, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         input.layer,
@@ -190,6 +210,7 @@ export class WeaveDatabase {
         input.canonicalText,
         input.confidence ?? 1.0,
         "active",
+        JSON.stringify(input.sourceRefs ?? []),
         input.importance ?? 5,
         now,
         input.anchorAt ?? now,
@@ -198,7 +219,7 @@ export class WeaveDatabase {
         now
       ]
     );
-    this.persist();
+    this.persistIfNeeded();
     return id;
   }
 
@@ -213,7 +234,7 @@ export class WeaveDatabase {
       `UPDATE memory_nodes SET connection_count = connection_count + 1, updated_at = ? WHERE id = ? OR id = ?`,
       [new Date().toISOString(), fromId, toId]
     );
-    this.persist();
+    this.persistIfNeeded();
     return id;
   }
 
@@ -344,7 +365,7 @@ export class WeaveDatabase {
   updateMemoryNodeMetadata(id: string, metadata: any) {
     const now = new Date().toISOString();
     this.run(`UPDATE memory_nodes SET metadata = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(metadata), now, id]);
-    this.persist();
+    this.persistIfNeeded();
   }
 
   updateMemoryNode(id: string, updates: { metadata?: any, canonicalText?: string, title?: string, summary?: string }) {
@@ -374,18 +395,33 @@ export class WeaveDatabase {
       params.push(now);
       params.push(id);
       this.run(`UPDATE memory_nodes SET ${fields.join(", ")} WHERE id = ?`, params);
-      this.persist();
+      this.persistIfNeeded();
     }
   }
 
 
-  getMemoryNodesByFilters(filters: { app?: string, dateStart?: string, dateEnd?: string }, limit = 50): MemoryNode[] {
+  getMemoryNodesByFilters(filters: { app?: string, dateStart?: string, dateEnd?: string, layers?: MemoryLayer[], subtype?: string, windowTitle?: string }, limit = 50): MemoryNode[] {
     let sql = `SELECT * FROM memory_nodes WHERE 1=1`;
     const params: SqlValue[] = [];
     
     if (filters.app) {
       sql += ` AND json_extract(metadata, '$.app') = ?`;
       params.push(filters.app);
+    }
+
+    if (filters.windowTitle) {
+      sql += ` AND json_extract(metadata, '$.windowTitle') = ?`;
+      params.push(filters.windowTitle);
+    }
+
+    if (filters.subtype) {
+      sql += ` AND subtype = ?`;
+      params.push(filters.subtype);
+    }
+
+    if (filters.layers?.length) {
+      sql += ` AND layer IN (${filters.layers.map(() => "?").join(", ")})`;
+      params.push(...filters.layers);
     }
     
     if (filters.dateStart) {
@@ -407,6 +443,91 @@ export class WeaveDatabase {
   getMemoryNode(id: string): MemoryNode | undefined {
     const row = this.one(`SELECT * FROM memory_nodes WHERE id = ?`, [id]);
     return row ? this.mapMemoryNode(row) : undefined;
+  }
+
+  getMemoryNodesByLayerAndSubtype(layer: MemoryLayer, subtype: string, limit = 500): MemoryNode[] {
+    return this.all(
+      `SELECT * FROM memory_nodes WHERE layer = ? AND subtype = ? ORDER BY anchor_at DESC, created_at DESC LIMIT ?`,
+      [layer, subtype, limit]
+    ).map((row) => this.mapMemoryNode(row));
+  }
+
+  getMemoryNodesByIds(ids: string[]): MemoryNode[] {
+    const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+    return uniqueIds.map((id) => this.getMemoryNode(id)).filter((node): node is MemoryNode => Boolean(node));
+  }
+
+  getRecentRawNodes(limit = 50, options?: { dateStart?: string; dateEnd?: string; app?: string; windowTitle?: string; subtype?: string }) {
+    return this.getMemoryNodesByFilters({
+      ...options,
+      layers: ["RAW"]
+    }, limit);
+  }
+
+  getRecentEpisodeNodes(limit = 50, options?: { dateStart?: string; dateEnd?: string; app?: string; windowTitle?: string; subtype?: string }) {
+    return this.getMemoryNodesByFilters({
+      ...options,
+      layers: ["EPISODE"]
+    }, limit);
+  }
+
+  searchRawNodesExact(query: string, limit = 20, filters?: { apps?: string[]; dateStart?: string; dateEnd?: string }) {
+    const normalized = String(query || "").trim().toLowerCase();
+    if (normalized.length < 4) return [] as MemoryNode[];
+
+    let sql = `SELECT * FROM memory_nodes WHERE layer = 'RAW' AND LOWER(COALESCE(canonical_text, '')) LIKE ?`;
+    const params: SqlValue[] = [`%${normalized}%`];
+
+    if (filters?.apps?.length) {
+      sql += ` AND json_extract(metadata, '$.app') IN (${filters.apps.map(() => "?").join(", ")})`;
+      params.push(...filters.apps);
+    }
+
+    if (filters?.dateStart) {
+      sql += ` AND anchor_at >= ?`;
+      params.push(filters.dateStart);
+    }
+
+    if (filters?.dateEnd) {
+      sql += ` AND anchor_at <= ?`;
+      params.push(filters.dateEnd);
+    }
+
+    sql += ` ORDER BY anchor_at DESC LIMIT ?`;
+    params.push(limit);
+    return this.all(sql, params).map((row) => this.mapMemoryNode(row));
+  }
+
+  searchRawNodesByKeywords(keywords: string[], limit = 80, filters?: { subtype?: string; dateStart?: string; dateEnd?: string }) {
+    const normalized = Array.from(new Set(
+      keywords
+        .map((keyword) => String(keyword || "").trim().toLowerCase())
+        .filter(Boolean)
+    ));
+    if (normalized.length === 0) return [] as MemoryNode[];
+
+    const clauses = normalized.map(() => "(LOWER(COALESCE(canonical_text, '')) LIKE ? OR LOWER(COALESCE(title, '')) LIKE ?)");
+    const params: SqlValue[] = [];
+    for (const keyword of normalized) {
+      params.push(`%${keyword}%`, `%${keyword}%`);
+    }
+
+    let sql = `SELECT * FROM memory_nodes WHERE layer = 'RAW'`;
+    if (filters?.subtype) {
+      sql += ` AND subtype = ?`;
+      params.unshift(filters.subtype);
+    }
+    if (filters?.dateStart) {
+      sql += ` AND anchor_at >= ?`;
+      params.push(filters.dateStart);
+    }
+    if (filters?.dateEnd) {
+      sql += ` AND anchor_at <= ?`;
+      params.push(filters.dateEnd);
+    }
+    sql += ` AND (${clauses.join(" OR ")}) ORDER BY anchor_at DESC LIMIT ?`;
+    params.push(limit);
+    return this.all(sql, params).map((row) => this.mapMemoryNode(row));
   }
 
   getSurroundingNodes(nodeId: string, depth = 2): MemoryNode[] {
@@ -450,7 +571,7 @@ export class WeaveDatabase {
       `INSERT INTO chat_sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`,
       [id, title, now, now]
     );
-    this.persist();
+    this.persistIfNeeded();
     return { id, title, createdAt: now, updatedAt: now };
   }
 
@@ -468,14 +589,14 @@ export class WeaveDatabase {
   updateChatSessionTitle(id: string, title: string) {
     const now = new Date().toISOString();
     this.run(`UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?`, [title, now, id]);
-    this.persist();
+    this.persistIfNeeded();
   }
 
   deleteChatSession(id: string) {
     // cascade should handle messages if configured, but let's be explicit
     this.run(`DELETE FROM chat_messages WHERE session_id = ?`, [id]);
     this.run(`DELETE FROM chat_sessions WHERE id = ?`, [id]);
-    this.persist();
+    this.persistIfNeeded();
   }
 
   getChatSessions(): ChatSession[] {
@@ -498,7 +619,7 @@ export class WeaveDatabase {
       [id, sessionId, role, content, thinkingTrace ?? null, traceStr, ts, now]
     );
     this.run(`UPDATE chat_sessions SET updated_at = ? WHERE id = ?`, [now, sessionId]);
-    this.persist();
+    this.persistIfNeeded();
     return id;
   }
 
@@ -521,38 +642,46 @@ export class WeaveDatabase {
   // --- Utilities ---
 
   kvSet(key: string, value: any, type?: string) {
+    this.kvMemory.set(key, value);
+    this.kvLoaded.add(key);
     this.run(
       `INSERT OR REPLACE INTO kv_cache (key, value, type, created_at) VALUES (?, ?, ?, ?)`,
       [key, JSON.stringify(value), type ?? null, new Date().toISOString()]
     );
-    this.persist();
+    this.persistIfNeeded();
   }
 
   kvGet<T>(key: string): T | undefined {
+    if (this.kvLoaded.has(key)) {
+      return this.kvMemory.get(key) as T | undefined;
+    }
     const row = this.one(`SELECT value FROM kv_cache WHERE key = ?`, [key]);
-    return row ? safeJson(stringValue(row.value), undefined) : undefined;
+    const value = row ? safeJson(stringValue(row.value), undefined) : undefined;
+    this.kvLoaded.add(key);
+    this.kvMemory.set(key, value);
+    return value;
   }
 
   // Blacklist is now managed via SettingsService
 
-  upsertGoogleAccount(input: { email?: string; accessToken?: string; refreshToken?: string; expiryDate?: number; scopes: string[] }) {
+  upsertGoogleAccount(input: { email?: string; expiryDate?: number; scopes: string[] }) {
     const now = new Date().toISOString();
     const existing = this.one("SELECT id FROM integration_accounts WHERE provider = 'google' LIMIT 1");
     if (existing) {
       this.run(
         `UPDATE integration_accounts
-         SET email = ?, access_token = ?, refresh_token = COALESCE(?, refresh_token), expiry_date = ?, scopes = ?, updated_at = ?
+         SET email = ?, access_token = NULL, refresh_token = NULL, expiry_date = ?, scopes = ?, updated_at = ?
          WHERE id = ?`,
-        [input.email ?? null, input.accessToken ?? null, input.refreshToken ?? null, input.expiryDate ?? null, JSON.stringify(input.scopes), now, existing.id]
+        [input.email ?? null, input.expiryDate ?? null, JSON.stringify(input.scopes), now, existing.id]
       );
     } else {
       this.run(
         `INSERT INTO integration_accounts (id, provider, email, access_token, refresh_token, expiry_date, scopes, created_at, updated_at)
-         VALUES (?, 'google', ?, ?, ?, ?, ?, ?, ?)`,
-        [createId(), input.email ?? null, input.accessToken ?? null, input.refreshToken ?? null, input.expiryDate ?? null, JSON.stringify(input.scopes), now, now]
+         VALUES (?, 'google', ?, NULL, NULL, ?, ?, ?, ?)`,
+        [createId(), input.email ?? null, input.expiryDate ?? null, JSON.stringify(input.scopes), now, now]
       );
     }
-    this.persist();
+    this.persistIfNeeded();
   }
 
   googleAccount() {
@@ -560,18 +689,59 @@ export class WeaveDatabase {
     if (!row) return undefined;
     return {
       email: optionalString(row.email),
-      access_token: optionalString(row.access_token),
-      refresh_token: optionalString(row.refresh_token),
       expiry_date: row.expiry_date ? numberValue(row.expiry_date) : undefined,
       last_sync_at: optionalString(row.last_sync_at),
       scopes: stringValue(row.scopes)
     };
   }
 
+  clearGoogleTokens() {
+    const now = new Date().toISOString();
+    this.run(
+      "UPDATE integration_accounts SET access_token = NULL, refresh_token = NULL, updated_at = ? WHERE provider = 'google'",
+      [now]
+    );
+    this.persistIfNeeded();
+  }
+
   markGoogleSynced() {
     const now = new Date().toISOString();
     this.run("UPDATE integration_accounts SET last_sync_at = ?, updated_at = ? WHERE provider = 'google'", [now, now]);
-    this.persist();
+    this.persistIfNeeded();
+  }
+
+  setSubsystemHealth(
+    subsystem: "capture" | "googleSync" | "appleContacts",
+    status: {
+      lastSuccessAt?: string;
+      lastFailureAt?: string;
+      lastFailureMessage?: string;
+      lastOcrAt?: string;
+      lastIndexedAt?: string;
+      cadenceStatus?: string;
+      queueDepth?: number;
+      indexQueueDepth?: number;
+      synthesisQueueDepth?: number;
+      skippedTicks?: number;
+      captureLagMs?: number;
+      ocrDurationMs?: number;
+      captureDurationMs?: number;
+      lastProactiveDurationMs?: number;
+      lastRoutineDurationMs?: number;
+      lastGoogleSyncDurationMs?: number;
+      retrievalCoverage?: string;
+    }
+  ) {
+    const current = { ...(this.kvGet<Record<string, any>>("subsystem_health") || {}) };
+    current[subsystem] = {
+      ...(current[subsystem] || {}),
+      ...status
+    };
+    this.kvSet("subsystem_health", current, "json");
+  }
+
+  getSubsystemHealth() {
+    return this.kvGet<Record<string, any>>("subsystem_health") || {};
   }
 
   private mapMemoryNode(row: SqlRow): MemoryNode {
@@ -582,6 +752,7 @@ export class WeaveDatabase {
       title: stringValue(row.title),
       summary: stringValue(row.summary),
       canonicalText: stringValue(row.canonical_text),
+      sourceRefs: safeJson(stringValue(row.source_refs), []),
       confidence: numberValue(row.confidence),
       status: stringValue(row.status),
       metadata: safeJson(stringValue(row.metadata), {}),
@@ -595,30 +766,13 @@ export class WeaveDatabase {
   }
 
   private seedDefaults() {
-    // No-op for blacklist (managed in SettingsService)
-
-    if (Object.keys(this.getCoreIdentity()).length === 0) {
-      this.setCoreIdentity("identity", {
-        name: "Willem T",
-        base: "Paris",
-        skills: ["JavaScript", "Python", "Relationship Tech"]
-      });
-      this.setCoreIdentity("active_context", {
-        mission: "Build Anqer as a proactive memory layer",
-        current_blockers: ["WebSocket permissions in manifest v3"],
-        upcoming_deadlines: ["2026-04-29: IGCSE Chinese Exam"]
-      });
-      this.setCoreIdentity("preferences", {
-        output_style: "ASCII only, high technical detail",
-        interaction_mode: "Partner-in-crime"
-      });
-    }
+    // Intentional no-op. Private beta accounts must start empty.
   }
 
   deleteAllData() {
     const tables = [
       "events", "memory_nodes", "memory_edges", "text_chunks", 
-      "chat_sessions", "chat_messages", "kv_cache", "integration_accounts",
+      "chat_sessions", "chat_messages", "kv_cache", "integration_accounts", "core_identity",
       "memory_nodes_fts", "text_chunks_fts"
     ];
     for (const table of tables) {
@@ -628,12 +782,27 @@ export class WeaveDatabase {
         console.warn(`[Database] Failed to clear table ${table}:`, e);
       }
     }
-    this.persist();
+    this.kvMemory.clear();
+    this.kvLoaded.clear();
+    this.persistIfNeeded();
     console.log("[Database] All data cleared successfully.");
+  }
+
+  writeBatch<T>(fn: () => T): T {
+    this.batchDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.batchDepth = Math.max(0, this.batchDepth - 1);
+      if (this.batchDepth === 0) {
+        this.persistIfNeeded();
+      }
+    }
   }
 
   private run(sql: string, params: SqlValue[] = []) {
     this.sqlite.run(sql, params);
+    this.dirty = true;
   }
 
   private all(sql: string, params: SqlValue[] = []): SqlRow[] {
@@ -650,6 +819,12 @@ export class WeaveDatabase {
 
   private persist() {
     fs.writeFileSync(this.dbPath, Buffer.from(this.sqlite.export()));
+    this.dirty = false;
+  }
+
+  private persistIfNeeded() {
+    if (this.batchDepth > 0 || !this.dirty) return;
+    this.persist();
   }
 }
 

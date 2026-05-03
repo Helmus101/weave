@@ -2,36 +2,25 @@ import { EventEmitter } from "node:events";
 import { IntelligenceEngine } from "./intelligence";
 import { RetrievalService } from "./retrieval";
 import { WeaveDatabase } from "../db/client";
+import type { ProactiveSuggestion, SourceReceipt } from "../../shared/types";
 
-export interface ProactiveSuggestion {
-  id: string;
-  category?: "relationship" | "project";
-  topic: string;
-  summary: string;
-  plan: string;
-  immediateTasks: string[];
-  aiCompletedWork?: string;
-  humanTasks?: string[];
-  contactName?: string;
-  trigger?: string;
-  whyNow?: string;
-  draftMessage?: string;
-  daysSinceLastContact?: number;
-  createdAt: string;
-  evidence?: string;
-  confidence?: number;
-  completedTasks?: string[];
-  completedAt?: string;
-}
+type SuggestionDraft = Omit<ProactiveSuggestion, "id" | "createdAt">;
+type SignatureHistory = Record<string, string>;
+type TopicRotation = Record<string, string>;
+const SIGNATURE_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+const TOPIC_ROTATION_RETENTION_MS = 36 * 60 * 60 * 1000;
+const MAX_HISTORY_ENTRIES = 250;
 
 export class ProactiveService extends EventEmitter {
   private interval: NodeJS.Timeout | null = null;
-  private readonly RELATIONSHIP_TOPICS = new Set(["follow-up", "nudge", "re-engage", "news"]);
-  private readonly MAX_PER_CATEGORY = 5;
-  private readonly MAX_ENRICH_CONCURRENCY = 2;
   private cachedStyleProfile = "";
   private styleProfileUpdatedAt = 0;
   private generationInProgress = false;
+  private readonly SIGNATURE_HISTORY_KEY = "proactive_signature_history";
+  private readonly TOPIC_ROTATION_KEY = "proactive_topic_rotation_history";
+  private readonly MAX_TOTAL = 6;
+  private readonly MAX_RELATIONSHIP = 3;
+  private readonly STALE_MS = 60 * 60 * 1000;
 
   constructor(
     private db: WeaveDatabase,
@@ -43,159 +32,117 @@ export class ProactiveService extends EventEmitter {
 
   start() {
     console.log("[Proactive] Starting background suggestion engine...");
-    // Run on start, then every 20 minutes to keep suggestions fresh.
-    this.generateSuggestions();
-    this.interval = setInterval(() => this.generateSuggestions(), 20 * 60 * 1000);
+    setTimeout(() => {
+      if (this.areSuggestionsStale()) {
+        void this.generateSuggestions();
+      } else {
+        console.log("[Proactive] Suggestions are fresh. Skipping startup generation.");
+        this.emit("suggestions", this.getSuggestions());
+      }
+    }, 45_000);
+    this.interval = setInterval(() => {
+      if (this.areSuggestionsStale() && this.canSpendBackgroundBudget()) {
+        void this.generateSuggestions();
+      }
+    }, 60 * 60 * 1000);
   }
 
   stop() {
     if (this.interval) clearInterval(this.interval);
+    this.interval = null;
   }
 
-  async generateSuggestions() {
+  getSuggestions(): ProactiveSuggestion[] {
+    try {
+      return (this.db.kvGet<ProactiveSuggestion[]>("proactive_suggestions") || [])
+        .slice(0, this.MAX_TOTAL)
+        .map((suggestion) => this.normalizeSuggestion({
+          ...suggestion,
+          evidenceBundle: (suggestion.evidenceBundle || []).slice(0, 3).map((receipt) => ({
+            ...receipt,
+            snippet: String(receipt.snippet || "").slice(0, 220)
+          }))
+        }))
+        .filter((suggestion) => !this.isDismissed(suggestion));
+    } catch (error) {
+      console.error("[Proactive] Failed reading cached suggestions. Resetting proactive cache:", error);
+      this.db.kvSet("proactive_suggestions", [], "json");
+      return [];
+    }
+  }
+
+  async generateSuggestions(): Promise<ProactiveSuggestion[]> {
     if (this.generationInProgress) {
       console.log("[Proactive] Generation already in progress. Skipping overlap.");
+      return this.getSuggestions();
+    }
+    if (!this.canSpendBackgroundBudget()) {
+      console.log("[Proactive] Generation deferred because capture/indexing is under load.");
       return this.getSuggestions();
     }
 
     this.generationInProgress = true;
     this.emit("generationState", { inProgress: true });
+    const startedAt = Date.now();
+
     try {
-      const existing = this.db.kvGet<ProactiveSuggestion[]>("proactive_suggestions") || [];
-      const completedTodaySignatures = new Set(
-        existing
-          .filter((suggestion) => this.isCompletedToday(suggestion))
-          .map((suggestion) => this.suggestionSignature(suggestion.topic, suggestion.summary))
-      );
-      const activeSuggestions = existing.filter((suggestion) => !this.isCompletedSuggestion(suggestion));
+      const existing = this.getSuggestions();
+      const handledKeys = new Set<string>([
+        ...existing.filter((s) => s.state === "completed" || Boolean(s.convertedRoutineId)).map((s) => this.suggestionSignature(s.topic, s.summary)),
+        ...existing.filter((s) => this.isCompletedToday(s)).map((s) => this.suggestionSignature(s.topic, s.summary)),
+        ...this.getRecentSignatureHistory()
+      ]);
 
-      const currentRelationships = activeSuggestions.filter((suggestion) => this.isRelationshipSuggestion(suggestion)).slice(0, this.MAX_PER_CATEGORY);
-      const currentProjects = activeSuggestions.filter((suggestion) => !this.isRelationshipSuggestion(suggestion)).slice(0, this.MAX_PER_CATEGORY);
-      const relationshipNeeded = Math.max(0, this.MAX_PER_CATEGORY - currentRelationships.length);
-      const projectNeeded = Math.max(0, this.MAX_PER_CATEGORY - currentProjects.length);
-
-      if (relationshipNeeded === 0 && projectNeeded === 0) {
-        const merged = [...currentRelationships, ...currentProjects];
-        this.db.kvSet("proactive_suggestions", merged, "json");
-        this.emit("suggestions", merged);
-        console.log("[Proactive] Already at max suggestions for both categories (5 each). Skipping.");
-        return merged;
-      }
-
-      const relationshipQuery = "What are the best things to do to strengthen my relationships?";
-      const tasksQuery = "What are my top tasks I should do?";
-
-
-      console.log(`[Proactive] Filling gaps. Needed: relationships=${relationshipNeeded}, tasks=${projectNeeded}`);
+      const active = existing.filter((s) => s.state === "active" && !this.isSnoozed(s));
+      const carryForward = this.rankSuggestions(active)
+        .filter((s) => !this.isCoolingDown(s))
+        .slice(0, 3);
 
       const [relationshipContext, taskContext] = await Promise.all([
-        this.buildMemoryFirstContext(relationshipQuery),
-        this.buildMemoryFirstContext(tasksQuery)
+        this.buildMemoryContext("Relationship priorities, reconnection opportunities, initiative imbalances, and people who matter this week."),
+        this.buildMemoryContext("Urgent tasks, unresolved loops, event preparation, and short high-leverage actions I should take next.")
       ]);
 
-      const [relationshipCandidates, taskCandidates, styleProfile, userInterests, projectContext] = await Promise.all([
-        this.generateCandidates(relationshipContext, "relationship", Math.max(relationshipNeeded * 3, relationshipNeeded)),
-        this.generateCandidates(taskContext, "project", Math.max(projectNeeded * 3, projectNeeded)),
-        this.getUserEmailStyleProfile(),
-        this.summarizeUserInterests(),
-        Promise.resolve(this.getProjectContext())
+      const candidateCount = 5;
+      const [relationshipDrafts, taskDrafts] = await Promise.all([
+        this.generateRelationshipSuggestions(relationshipContext, candidateCount, handledKeys),
+        this.generateTaskSuggestions(taskContext, candidateCount, handledKeys)
       ]);
 
-      const existingKeys = new Set(activeSuggestions.map((s) => this.suggestionSignature(s.topic, s.summary)));
-      for (const signature of completedTodaySignatures) {
-        existingKeys.add(signature);
-      }
-      const dedupeAndFilter = (items: Array<{ category: "project" | "relationship"; topic: string; summary: string; sourceContext: string }>) => {
-        const accepted: Array<{ category: "project" | "relationship"; topic: string; summary: string; sourceContext: string }> = [];
-        const seen = new Set<string>();
-        for (const item of items) {
-          const key = this.suggestionSignature(item.topic, item.summary);
-          if (existingKeys.has(key) || seen.has(key)) continue;
-          seen.add(key);
-          accepted.push(item);
-        }
-        return accepted;
-      };
-
-      const relPool = dedupeAndFilter(relationshipCandidates);
-      const taskPool = dedupeAndFilter(taskCandidates);
-
-      const relSelected = relPool.slice(0, relationshipNeeded);
-      const taskSelected = taskPool.slice(0, projectNeeded);
-
-      const relFallbackPool = relPool.slice(relSelected.length);
-      const taskFallbackPool = taskPool.slice(taskSelected.length);
-      const relBackfill = relFallbackPool.slice(0, Math.max(0, relationshipNeeded - relSelected.length));
-      const taskBackfill = taskFallbackPool.slice(0, Math.max(0, projectNeeded - taskSelected.length));
-      const relationshipBase = [...relSelected, ...relBackfill].slice(0, relationshipNeeded);
-      const taskBase = [...taskSelected, ...taskBackfill].slice(0, projectNeeded);
-
-      const newCandidates = [...relationshipBase, ...taskBase];
-
-      if (newCandidates.length === 0) {
-        console.log("[Proactive] No new candidates produced from model. Falling back to deterministic defaults.");
-      }
-
-      const baseCandidates = newCandidates.length > 0 ? newCandidates : this.defaultCandidates(relationshipNeeded, projectNeeded, relationshipContext, taskContext);
-
-
-      // Stage 2: Dig Deeper for each candidate
-      console.log(`[Proactive] Enriching ${baseCandidates.length} candidates...`);
-      const enriched = await this.mapWithConcurrency(baseCandidates, this.MAX_ENRICH_CONCURRENCY, async (candidate) => {
-
-        // Perform targeted search to "dig deeper" for this specific candidate
-        const deepDiveQuery = `Detailed context for: ${candidate.topic} - ${candidate.summary}`;
-        const { results: deepDiveResults } = await this.retrieval.searchWithTrace(deepDiveQuery, 15);
-        const deepDiveContext = deepDiveResults.map(r => `${r.title}: ${r.snippet}`).join("\n");
-        
-        return this.enrichSuggestion(candidate, styleProfile, userInterests, projectContext, deepDiveContext);
+      const stampDraft = (suggestion: SuggestionDraft): ProactiveSuggestion => ({
+        id: Math.random().toString(36).slice(2),
+        createdAt: new Date().toISOString(),
+        ...suggestion
       });
 
-      const qualityFiltered = enriched
-        .filter((suggestion) => this.isHighQualitySuggestion(suggestion));
+      const candidates = [...carryForward, ...relationshipDrafts.map(stampDraft), ...taskDrafts.map(stampDraft)]
+        .map((suggestion) => this.normalizeSuggestion(suggestion))
+        .filter((suggestion, index, arr) => {
+          const signature = this.suggestionSignature(suggestion.topic, suggestion.summary);
+          return arr.findIndex((item) => this.suggestionSignature(item.topic, item.summary) === signature) === index;
+        })
+        .filter((suggestion) => !this.isDismissed(suggestion) && !this.isSnoozed(suggestion))
+        .filter((suggestion) => !this.isTopicRecentlySurfaced(suggestion))
+        .filter((suggestion) => !handledKeys.has(this.suggestionSignature(suggestion.topic, suggestion.summary)));
 
-      const highQuality = qualityFiltered.map((suggestion) => ({
-        id: Math.random().toString(36).substring(7),
+      const ranked = this.rankSuggestions(candidates);
+      const selected = this.selectDashboardSuggestions(ranked);
+
+      this.recordSignatureHistory(selected);
+      this.recordTopicRotation(selected);
+      this.db.kvSet("proactive_suggestions", selected.map((suggestion) => ({
         ...suggestion,
-        createdAt: new Date().toISOString()
-      }));
-
-      const highQualityRelationships = highQuality.filter((suggestion) => this.isRelationshipSuggestion(suggestion)).slice(0, relationshipNeeded);
-      const highQualityProjects = highQuality.filter((suggestion) => !this.isRelationshipSuggestion(suggestion)).slice(0, projectNeeded);
-
-      const relationshipGapAfterQuality = Math.max(0, relationshipNeeded - highQualityRelationships.length);
-      const taskGapAfterQuality = Math.max(0, projectNeeded - highQualityProjects.length);
-
-      const fallbackRelationships = relationshipGapAfterQuality > 0
-        ? this.buildFallbackRelationshipSuggestions(relationshipGapAfterQuality, relationshipContext)
-        : [];
-      const fallbackProjects = taskGapAfterQuality > 0
-        ? this.buildFallbackTaskSuggestions(taskGapAfterQuality, taskContext)
-        : [];
-
-      const fallbackHighQualityRelationships = fallbackRelationships
-        .filter((suggestion) => !completedTodaySignatures.has(this.suggestionSignature(suggestion.topic, suggestion.summary)))
-        .map((suggestion) => ({
-          id: Math.random().toString(36).substring(7),
-          ...suggestion,
-          createdAt: new Date().toISOString()
-        }));
-
-      const fallbackHighQualityProjects = fallbackProjects
-        .filter((suggestion) => !completedTodaySignatures.has(this.suggestionSignature(suggestion.topic, suggestion.summary)))
-        .map((suggestion) => ({
-          id: Math.random().toString(36).substring(7),
-          ...suggestion,
-          createdAt: new Date().toISOString()
-        }));
-
-      const mergedRelationships = [...currentRelationships, ...highQualityRelationships, ...fallbackHighQualityRelationships].slice(0, this.MAX_PER_CATEGORY);
-      const mergedProjects = [...currentProjects, ...highQualityProjects, ...fallbackHighQualityProjects].slice(0, this.MAX_PER_CATEGORY);
-      const merged = [...mergedRelationships, ...mergedProjects];
-      this.db.kvSet("proactive_suggestions", merged, "json");
-      this.emit("suggestions", merged);
-      console.log(`[Proactive] Finished sync. Added ${highQualityRelationships.length} relationship suggestions and ${highQualityProjects.length} task suggestions. Active=${mergedRelationships.length}/5 relationships, ${mergedProjects.length}/5 tasks.`);
-      return merged;
+        evidenceBundle: (suggestion.evidenceBundle || []).slice(0, 3).map((receipt) => ({
+          ...receipt,
+          snippet: String(receipt.snippet || "").slice(0, 220)
+        }))
+      })), "json");
+      this.db.setSubsystemHealth("capture", {
+        lastProactiveDurationMs: Date.now() - startedAt
+      });
+      this.emit("suggestions", selected);
+      console.log(`[Proactive] Done. Selected ${selected.length} ranked suggestions.`);
+      return selected;
     } catch (e) {
       console.error("[Proactive] Generation failed:", e);
       return this.getSuggestions();
@@ -205,426 +152,405 @@ export class ProactiveService extends EventEmitter {
     }
   }
 
-  getSuggestions(): ProactiveSuggestion[] {
-    return this.db.kvGet<ProactiveSuggestion[]>("proactive_suggestions") || [];
+  async getTaskDetail(summary: string, plan?: string, evidence?: string): Promise<string> {
+    const context = await this.buildMemoryContext(`Steps to accomplish: ${summary}`);
+
+    const prompt = `You are Weave, the user's chief-of-staff assistant.
+
+Task: ${summary}
+${plan ? `Context: ${plan}` : ""}
+${evidence ? `Evidence: ${evidence}` : ""}
+
+Memory context:
+${context.slice(0, 4000)}
+
+Produce the most useful work product you can right now.
+
+1. If writing or planning would help, generate the draft or structured plan directly.
+2. End with a section titled **What you still need to do:** listing 1-3 concrete real-world actions the user must take.
+3. Be concise, executive, and operational. No preamble.`;
+
+    try {
+      return await this.intelligence.generateDirectly(prompt);
+    } catch (e) {
+      console.error("[Proactive] getTaskDetail failed:", e);
+      return "I could not generate a full workup, but the next best move is to use the evidence and next action above as your operating brief.";
+    }
   }
 
-  private async enrichSuggestion(
-    candidate: { category?: "project" | "relationship"; topic: string; summary: string; sourceContext: string }, 
-    styleProfile: string,
-    userInterests: string,
-    projectContext: string,
-    deepDiveContext: string
-  ): Promise<Omit<ProactiveSuggestion, "id" | "createdAt">> {
-    const isRelationship = candidate.category === "relationship" || this.RELATIONSHIP_TOPICS.has(candidate.topic.toLowerCase());
-    const relScore = Math.floor(Math.random() * 40) + 30; // 30-70 range
+  private areSuggestionsStale(): boolean {
+    const existing = this.getSuggestions().filter((s) => s.state === "active");
+    if (existing.length === 0) return true;
+    const latestTs = existing.reduce((max, s) => {
+      const t = new Date(s.createdAt).getTime();
+      return t > max ? t : max;
+    }, 0);
+    return !Number.isFinite(latestTs) || (Date.now() - latestTs) > this.STALE_MS;
+  }
 
-    const prompt = isRelationship ? `
-### TASK: Relational Proactive Nudge (RPN)
-Generate a high-EQ outreach suggestion for ${candidate.topic}.
+  private selectDashboardSuggestions(suggestions: ProactiveSuggestion[]) {
+    const selected: ProactiveSuggestion[] = [];
+    let relationshipCount = 0;
 
-### CORE MEMORIES (GOLD SET)
-${candidate.sourceContext}
-
-### DEEP DIVE CONTEXT
-${deepDiveContext}
-
-### USER'S CURRENT FOCUS
-${userInterests}
-
-### INSTRUCTIONS FOR RPN
-Classify into one of these categories:
-1. **Nurture**: "You're losing someone." Interaction frequency dropped vs baseline.
-2. **Life Event**: Someone's world changed (job change, funding, launch).
-3. **Warm Intro**: Two people in your graph should meet.
-4. **Context Prep**: Meeting coming up, surface key "ghost memories".
-5. **Strategic**: High-proximity contact you haven't followed up with.
-
-REQUIRED:
-- Be specific. Mention exact day counts (e.g., "haven't talked in 58 days") or baseline shifts (e.g., "8 interactions in March, now zero").
-- Reference a SPECIFIC detail from the Deep Dive context.
-- Provide a pre-written draft message that references a "Value Add".
-- Use the user's style profile for the draft.
-
-### OUTPUT FORMAT (JSON)
-{
-  "category": "relationship",
-  "topic": "Concise Name (2-3 words)",
-  "contactName": "${candidate.topic}",
-  "summary": "🔴 [Punchy summary - max 12 words]",
-
-  "draftMessage": "[A 2-3 sentence personalized outreach opener]",
-  "plan": "### Relationship Context\\n- **Baseline**: [e.g. 5 interactions/mo]\\n- **Current Gap**: [e.g. 45 days quiet]\\n- **Signal**: [e.g. Moved to Canva 12 days ago]\\n\\n**Why reach out?** [Detailed rationale]",
-  "trigger": "Context-derived trigger",
-  "whyNow": "Why this matters now",
-  "evidence": "Memory anchor",
-  "confidence": 85,
-  "immediateTasks": ["Send Reach-out"]
-}` : `
-### TASK: Actionable Context Task (ACT)
-Identify unresolved tasks, blockers, and opportunities for automation.
-
-### PROJECT HIERARCHY
-${projectContext}
-
-### CORE MEMORIES (GOLD SET)
-${candidate.sourceContext}
-
-### DEEP DIVE CONTEXT
-${deepDiveContext}
-
-### INSTRUCTIONS FOR ACT
-1. **Detect "Ghost Tasks"**: Look for unanswered questions, TODOs, or deadlines buried in transcripts/emails.
-2. **Automate the Output**: If the task can be automated (e.g., creating a study plan, drafting a project outline, or building a comparison table), DO IT NOW in the 'plan' field.
-3. **Receipts**: Every task must have a "Source Link" (App + Approximate Time/Date).
-4. **No Placeholders**: Do NOT output generic phrases like "Key task extraction", "Review tasks", "Top to-do", or "Next task".
-5. **Concrete Action**: The summary must be a real task starting with an action verb (e.g., "Draft", "Send", "Schedule", "Review", "Finalize").
-
-### OUTPUT FORMAT (JSON)
-{
-  "category": "project",
-  "topic": "Concise stream (2-3 words)",
-  "summary": "Concrete action (max 12 words)",
-
-  "plan": "Detailed plan with concrete steps and rationale from memory evidence",
-  "aiCompletedWork": "Concrete artifact already prepared by AI",
-  "immediateTasks": ["First concrete next action", "Second concrete next action"],
-  "confidence": 95,
-  "evidence": "Memory or web anchor"
-}`;
-
-    const response = await this.intelligence.generateDirectly(prompt);
-    const jsonMatch = response.match(/\{.*\}/s);
-    if (!jsonMatch) {
-      return {
-        category: candidate.category || "project",
-        topic: candidate.topic,
-        summary: candidate.summary,
-        plan: `AI prepared the next step based on current memory context. Review the context and complete only the remaining external actions.`,
-        aiCompletedWork: candidate.sourceContext,
-        immediateTasks: ["Review Context"],
-        confidence: 50
-      };
+    for (const suggestion of suggestions) {
+      if (selected.length >= this.MAX_TOTAL) break;
+      if (suggestion.category === "relationship" && relationshipCount >= this.MAX_RELATIONSHIP) {
+        continue;
+      }
+      selected.push(suggestion);
+      if (suggestion.category === "relationship") relationshipCount += 1;
     }
 
-    const parsed = JSON.parse(jsonMatch[0]);
-    const contactName = String(parsed.contactName || this.inferContactName(candidate.sourceContext) || "").trim();
-    const rawDraft = String(parsed.draftMessage || "").trim();
-    const draftMessage = isRelationship
-      ? await this.rewriteInUserVoice(rawDraft, styleProfile, contactName || undefined, candidate.sourceContext)
-      : rawDraft;
+    return selected.map((suggestion) => this.normalizeSuggestion(suggestion));
+  }
+
+  private rankSuggestions(suggestions: ProactiveSuggestion[]) {
+    return [...suggestions]
+      .map((suggestion) => this.normalizeSuggestion(suggestion))
+      .sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0));
+  }
+
+  private normalizeSuggestion(suggestion: ProactiveSuggestion): ProactiveSuggestion {
+    const evidenceDensity = Math.min(1, ((suggestion.evidenceBundle?.length || 0) + (suggestion.evidence ? 1 : 0)) / 3);
+    const confidence = Math.max(0, Math.min(100, suggestion.confidence || 75));
+    const urgency = this.computeUrgencyScore(suggestion);
+    const novelty = this.computeNoveltyScore(suggestion);
+    const impact = this.computeImpactScore(suggestion);
+    const freshnessScore = this.computeFreshnessScore(suggestion);
+    const priorityScore = Math.round(
+      confidence * 0.28
+      + urgency * 0.32
+      + novelty * 0.16
+      + impact * 0.16
+      + evidenceDensity * 100 * 0.08
+    );
+    const nextAction = suggestion.nextAction
+      || suggestion.impliedAction
+      || suggestion.immediateTasks?.[0]
+      || suggestion.humanTasks?.[0]
+      || undefined;
+    const lane = suggestion.lane || (priorityScore >= 73 ? "do_now" : "keep_warm");
+    const sourceMix = suggestion.sourceMix?.length
+      ? suggestion.sourceMix
+      : this.inferSourceMix(suggestion);
 
     return {
-      category: parsed.category === "relationship" ? "relationship" : (isRelationship ? "relationship" : "project"),
-      topic: parsed.topic || candidate.topic,
-      summary: parsed.summary || candidate.summary,
-      plan: parsed.plan || "AI identified the next steps based on your recent activity.",
-      aiCompletedWork: parsed.aiCompletedWork || candidate.sourceContext,
-      contactName: contactName || undefined,
-      trigger: parsed.trigger,
-      whyNow: parsed.whyNow,
-      draftMessage: draftMessage || undefined,
-      daysSinceLastContact: Number.isFinite(parsed.daysSinceLastContact) ? parsed.daysSinceLastContact : undefined,
-      evidence: parsed.evidence || candidate.sourceContext.slice(0, 60) + "...",
-      confidence: parsed.confidence || 70,
-      immediateTasks: Array.isArray(parsed.immediateTasks) ? parsed.immediateTasks.slice(0, 3) : [],
-      humanTasks: Array.isArray(parsed.humanTasks) ? parsed.humanTasks.slice(0, 5) : []
+      ...suggestion,
+      state: suggestion.state || (suggestion.completedAt ? "completed" : "active"),
+      nextAction,
+      freshnessScore,
+      priorityScore,
+      sourceMix,
+      lane,
+      reasonIncluded: suggestion.reasonIncluded || this.buildReasonIncluded(suggestion, priorityScore, freshnessScore),
+      noveltyKey: suggestion.noveltyKey || this.suggestionSignature(suggestion.topic, suggestion.summary),
+      supportingNodeIds: suggestion.supportingNodeIds || [],
+      supportingEventIds: suggestion.supportingEventIds || []
     };
   }
 
-  private normalizeCategory(candidate: { category?: string; topic: string; summary: string; sourceContext: string }): "project" | "relationship" {
-    const category = String(candidate.category || "").toLowerCase().trim();
-    if (category === "relationship") return "relationship";
-
-    const text = `${candidate.topic} ${candidate.summary} ${candidate.sourceContext}`.toLowerCase();
-    if (this.RELATIONSHIP_TOPICS.has(candidate.topic.toLowerCase())) return "relationship";
-    if (/(follow up|follow-up|relationship|intro|introduction|reach out|re-engage|contact|network|nudge)/.test(text)) {
-      return "relationship";
+  private computeUrgencyScore(suggestion: ProactiveSuggestion) {
+    let score = 45;
+    const text = `${suggestion.whyNow || ""} ${suggestion.plan || ""} ${suggestion.evidence || ""}`.toLowerCase();
+    if (/today|tomorrow|this afternoon|this morning|tonight|upcoming|before|deadline|meeting|calendar|scheduled/.test(text)) score += 20;
+    if (/waiting|blocked|stalled|overdue|carry-over|carried over|follow-up pending|unanswered/.test(text)) score += 12;
+    if (typeof suggestion.daysSinceLastContact === "number") {
+      score += Math.min(20, Math.max(0, suggestion.daysSinceLastContact / 3));
     }
-    return "project";
+    if (suggestion.suggestionClass === "event_prep") score += 18;
+    if (suggestion.suggestionClass === "unresolved_loop") score += 14;
+    return Math.min(100, score);
   }
 
-  private async buildMemoryFirstContext(query: string): Promise<string> {
-    try {
-      const { results, filters } = await this.retrieval.searchWithTrace(query, 20);
-      const context = results
-        .map((result) => `${result.title}: ${result.snippet}`)
-        .join("\n");
-      const recent = await this.retrieval.getRecentContext(filters);
-      const combined = [context, recent].filter(Boolean).join("\n\n");
-      if (combined.trim()) return combined;
-    } catch (error) {
-      console.warn("[Proactive] Retrieval context build failed:", error);
-    }
-
-    const fallbackEvents = this.db.getRecentEvents(80)
-      .map((event) => `${event.type}@${event.timestamp}: ${String(event.text || "").replace(/\s+/g, " ").slice(0, 140)}`)
-      .filter(Boolean)
-      .slice(0, 30)
-      .join("\n");
-    return fallbackEvents || "No context available.";
+  private computeImpactScore(suggestion: ProactiveSuggestion) {
+    let score = 55;
+    if (suggestion.category === "relationship") score += 10;
+    if (suggestion.suggestionClass === "momentum_opportunity") score += 10;
+    if (suggestion.suggestionClass === "relationship_nudge") score += 6;
+    if ((suggestion.plan || "").split(".").length > 2) score += 6;
+    if ((suggestion.evidenceBundle?.length || 0) >= 2) score += 8;
+    return Math.min(100, score);
   }
 
-  private async generateCandidates(
+  private computeFreshnessScore(suggestion: ProactiveSuggestion) {
+    const createdAt = new Date(suggestion.createdAt || Date.now()).getTime();
+    if (!Number.isFinite(createdAt)) return 50;
+    const elapsedHours = (Date.now() - createdAt) / (60 * 60 * 1000);
+    return Math.max(20, Math.min(100, 100 - elapsedHours * 8));
+  }
+
+  private computeNoveltyScore(suggestion: ProactiveSuggestion) {
+    let score = 72;
+    if (this.getRecentSignatureHistory().includes(this.suggestionSignature(suggestion.topic, suggestion.summary))) score -= 28;
+    if (this.isTopicRecentlySurfaced(suggestion)) score -= 18;
+    if (suggestion.convertedRoutineId) score -= 40;
+    return Math.max(10, Math.min(100, score));
+  }
+
+  private inferSourceMix(suggestion: ProactiveSuggestion): Array<"memory" | "web" | "calendar" | "contacts"> {
+    const mix = new Set<"memory" | "web" | "calendar" | "contacts">(["memory"]);
+    if (suggestion.category === "relationship") mix.add("contacts");
+    if (/calendar|meeting|scheduled/.test(`${suggestion.whyNow || ""} ${suggestion.plan || ""}`.toLowerCase())) mix.add("calendar");
+    return [...mix];
+  }
+
+  private buildReasonIncluded(suggestion: ProactiveSuggestion, priorityScore: number, freshnessScore: number) {
+    const reasons: string[] = [];
+    if (priorityScore >= 78) reasons.push("high leverage");
+    if (freshnessScore >= 70) reasons.push("fresh context");
+    if (suggestion.suggestionClass === "event_prep") reasons.push("time-bound");
+    if (suggestion.category === "relationship") reasons.push("relationship signal");
+    if ((suggestion.evidenceBundle?.length || 0) > 1) reasons.push("multi-source evidence");
+    return reasons.length > 0
+      ? `Surfaced because this looks ${reasons.join(", ")}.`
+      : "Surfaced because recent memory signals point to a concrete next move.";
+  }
+
+  private async generateRelationshipSuggestions(
     context: string,
-    mode: "relationship" | "project",
-    maxItems: number
-  ): Promise<Array<{ category: "project" | "relationship"; topic: string; summary: string; sourceContext: string }>> {
-    if (maxItems <= 0) return [];
+    count: number,
+    existingKeys: Set<string>
+  ): Promise<SuggestionDraft[]> {
+    if (!context.trim()) return [];
 
-    const prompt = mode === "relationship"
-      ? `
-You are generating Relationship Radar candidates.
+    const styleProfile = await this.getUserEmailStyleProfile();
+    const prompt = `You are the user's chief-of-staff for relationships.
 
-Core objective: What are the best things to do to strengthen my relationships?
+Memory Context:
+${context.slice(0, 12000)}
 
+Generate up to ${count} relationship actions that are worth surfacing now.
 
-Context:
-${context.slice(0, 9000)}
+Requirements:
+- Only use people actually present in memory.
+- Each suggestion must feel executive and specific.
+- State the exact signal behind the suggestion.
+- Give one low-friction next move.
+- Avoid generic phrases like "follow up" without object or context.
+- Prefer neglected, time-sensitive, asymmetric, or opportunistic relationships.
 
-Return ONLY valid JSON array with up to ${Math.max(1, maxItems)} items:
+Return ONLY valid JSON array:
 [
   {
     "category": "relationship",
-    "topic": "short name",
-    "summary": "concise person action",
-    "sourceContext": "evidence"
+    "insightCategory": "health" | "initiative" | "opportunity" | "neglected" | "asymmetry",
+    "contactName": "First name only",
+    "topic": "Short label",
+    "summary": "Specific, human-readable action framing",
+    "interpretation": "Two grounded sentences explaining the signal",
+    "whyNow": "One sentence about why this matters now",
+    "impliedAction": "One clear next move under 5 minutes",
+    "draftMessage": "2-3 sentence natural opener",
+    "plan": "Evidence-backed relationship briefing",
+    "daysSinceLastContact": 12,
+    "evidence": "Specific observed memory anchor with time if available",
+    "confidence": 80,
+    "nextAction": "Single next move",
+    "immediateTasks": ["Single next action"]
   }
-]`
-      : `
-You are generating top to-do and project candidates.
-
-Core objective: What are my top tasks I should do?
-
-
-Context:
-${context.slice(0, 9000)}
-
-Return ONLY valid JSON array with up to ${Math.max(1, maxItems)} items:
-[
-  {
-    "category": "project",
-    "topic": "short task name",
-    "summary": "concise task summary",
-    "sourceContext": "evidence"
-  }
-]
-
-Rules:
-- Every summary must start with an action verb: Draft, Send, Review, Finalize, Ship, Schedule, Prepare.
-- Every summary must include a concrete deliverable, not a placeholder.
-- Forbidden summaries: "Key task extraction", "Review tasks", "Top to-do", "Next task", "Follow up later".
-- Use source evidence from context with specific app/time clues when available.`;
+]`;
 
     try {
       const response = await this.intelligence.generateDirectly(prompt);
       const match = response.match(/\[.*\]/s);
       if (!match) return [];
-      const parsed = JSON.parse(match[0]);
+      const parsed: any[] = JSON.parse(match[0]);
       if (!Array.isArray(parsed)) return [];
-      return parsed
-        .map((item) => ({
-          category: this.normalizeCategory(item),
-          topic: String(item.topic || "").trim(),
-          summary: String(item.summary || "").trim(),
-          sourceContext: String(item.sourceContext || context.slice(0, 600)).trim()
-        }))
-        .filter((item) => item.topic && item.summary)
-        .slice(0, Math.max(1, maxItems));
-    } catch {
+
+      const results: SuggestionDraft[] = [];
+      for (const item of parsed.slice(0, count)) {
+        const contactName = String(item.contactName || "").trim();
+        const topic = String(item.topic || "Relationship").trim();
+        const summary = String(item.summary || "").trim();
+        if (!contactName || !summary) continue;
+        if (existingKeys.has(this.suggestionSignature(topic, summary))) continue;
+
+        const rawDraft = String(item.draftMessage || "").trim();
+        const draftMessage =
+          rawDraft && styleProfile
+            ? await this.rewriteInUserVoice(rawDraft, styleProfile, contactName, String(item.plan || ""))
+            : rawDraft;
+
+        const evidenceSnippet = String(item.evidence || item.plan || "").replace(/\s+/g, " ").slice(0, 220);
+        results.push({
+          category: "relationship",
+          suggestionClass: "relationship_nudge",
+          insightCategory: item.insightCategory || "health",
+          contactName,
+          topic,
+          summary,
+          interpretation: String(item.interpretation || "").trim() || undefined,
+          whyNow: String(item.whyNow || "").trim() || undefined,
+          impliedAction: String(item.impliedAction || "").trim() || undefined,
+          draftMessage: draftMessage || undefined,
+          plan: String(item.plan || "").trim(),
+          daysSinceLastContact: Number.isFinite(Number(item.daysSinceLastContact))
+            ? Number(item.daysSinceLastContact)
+            : undefined,
+          evidence: String(item.evidence || "").slice(0, 180),
+          evidenceBundle: [{
+            id: `relationship-${contactName}-${topic}`,
+            kind: "memory",
+            title: `${contactName} relationship context`,
+            snippet: evidenceSnippet,
+            reason: "Relationship memory evidence"
+          }],
+          confidence: Number(item.confidence) || 78,
+          nextAction: String(item.nextAction || item.impliedAction || item.immediateTasks?.[0] || "").trim() || undefined,
+          immediateTasks: Array.isArray(item.immediateTasks) ? item.immediateTasks.slice(0, 1).map(String) : [],
+          humanTasks: [],
+          noveltyKey: this.suggestionSignature(topic, summary),
+          sourceMix: ["memory", "contacts"],
+          reasonIncluded: "Surfaced from relationship recency, initiative, or opportunity signals.",
+          supportingNodeIds: [],
+          supportingEventIds: [],
+          state: "active"
+        });
+      }
+      return results;
+    } catch (e) {
+      console.error("[Proactive] Relationship generation failed:", e);
       return [];
     }
   }
 
-  private async summarizeUserInterests(): Promise<string> {
+  private async generateTaskSuggestions(
+    context: string,
+    count: number,
+    existingKeys: Set<string>
+  ): Promise<SuggestionDraft[]> {
+    if (!context.trim()) return [];
+
+    const prompt = `You are the user's chief-of-staff assistant.
+
+Memory Context:
+${context.slice(0, 12000)}
+
+Generate up to ${count} professional proactive suggestions.
+
+Requirements:
+- Focus on the best immediate actions, not generic goals.
+- Each suggestion must be grounded in a concrete signal from memory.
+- Summary must start with a strong action verb and specific object.
+- "Why now" must reference timing, momentum, deadline, meeting, or unresolved context.
+- Include exactly one next move.
+- Spread suggestions across:
+  - momentum_opportunity
+  - unresolved_loop
+  - event_prep
+  - habit_deviation
+  - latent_follow_up
+
+Return ONLY valid JSON array:
+[
+  {
+    "category": "project",
+    "suggestionClass": "momentum_opportunity" | "unresolved_loop" | "event_prep" | "habit_deviation" | "latent_follow_up",
+    "topic": "2-3 word task area",
+    "summary": "Action verb + specific deliverable",
+    "whyNow": "One grounded sentence explaining timing or leverage",
+    "plan": "2-3 sentences with evidence and next move",
+    "evidence": "Specific memory anchor with time if available",
+    "confidence": 85,
+    "nextAction": "Single next move",
+    "immediateTasks": ["Single next action"]
+  }
+]`;
+
     try {
-      const recentMemories = this.db.getRecentEvents(100);
-      if (recentMemories.length === 0) return "General productivity and follow-through.";
-      return await this.intelligence.generateDirectly(
-        `Summarize the user's top 3 active interests or focus areas from these memories:\n${recentMemories.map((m) => m.text).join("\n").slice(0, 5000)}`
-      );
-    } catch {
-      return "General productivity and follow-through.";
-    }
-  }
+      const response = await this.intelligence.generateDirectly(prompt);
+      const match = response.match(/\[.*\]/s);
+      if (!match) return [];
+      const parsed: any[] = JSON.parse(match[0]);
+      if (!Array.isArray(parsed)) return [];
 
-  private getProjectContext(): string {
-    const coreNodes = this.db.getMemoryNodes("CORE");
-    const labels = coreNodes
-      .map((node) => node.title)
-      .map((title) => String(title || "").trim())
-      .filter(Boolean)
-      .slice(0, 20);
-    return labels.join(", ") || "General Productivity";
-  }
+      const results: SuggestionDraft[] = [];
+      for (const item of parsed.slice(0, count)) {
+        const topic = String(item.topic || "Task").trim();
+        const summary = String(item.summary || "").trim();
+        if (!summary) continue;
+        if (existingKeys.has(this.suggestionSignature(topic, summary))) continue;
 
-  private defaultCandidates(
-    relationshipCount: number,
-    projectCount: number,
-    relationshipContext: string,
-    taskContext: string
-  ): Array<{ category: "project" | "relationship"; topic: string; summary: string; sourceContext: string }> {
-    const relContext = relationshipContext.slice(0, 600) || "Recent contact/network context";
-    const projContext = taskContext.slice(0, 600) || "Recent to-do/project context";
-    const seeded: Array<{ category: "project" | "relationship"; topic: string; summary: string; sourceContext: string }> = [];
-
-    for (let i = 0; i < relationshipCount; i += 1) {
-      seeded.push({
-        category: "relationship",
-        topic: i === 0 ? "Follow-up" : i === 1 ? "Re-engage" : "Network Opportunity",
-        summary: i === 0
-          ? "Send a targeted follow-up to strengthen an active relationship thread"
-          : i === 1
-            ? "Reconnect with someone important while the context is still warm"
-            : "Reach out to a high-value contact with a specific, timely reason",
-        sourceContext: relContext
-      });
-    }
-
-    for (let i = 0; i < projectCount; i += 1) {
-      seeded.push({
-        category: "project",
-        topic: i === 0 ? "Top To-Do" : i === 1 ? "Priority Workstream" : "Next Task",
-        summary: i === 0
-          ? "Close one high-impact pending task from recent activity"
-          : i === 1
-            ? "Unblock the next project milestone with a concrete next action"
-            : "Pick the next highest-leverage task and finish it",
-        sourceContext: projContext
-      });
-    }
-
-    return seeded;
-  }
-
-  private buildFallbackRelationshipSuggestions(
-    count: number,
-    relationshipContext: string
-  ): Array<Omit<ProactiveSuggestion, "id" | "createdAt">> {
-    const contextLine = relationshipContext.split("\n").find((line) => line.trim().length > 20) || "Recent relationship context detected";
-    const suggestions: Array<Omit<ProactiveSuggestion, "id" | "createdAt">> = [];
-    for (let i = 0; i < count; i += 1) {
-      suggestions.push({
-        category: "relationship",
-        topic: i % 2 === 0 ? "Follow-up" : "Re-engage",
-        summary: i % 2 === 0
-          ? "Send a targeted follow-up to keep an important relationship warm"
-          : "Reconnect with a key contact using recent shared context",
-        plan: `Use this context to personalize outreach: ${contextLine.slice(0, 220)}`,
-        contactName: undefined,
-        trigger: "Relationship context detected in recent memory",
-        whyNow: "Maintaining continuity prevents relationship decay",
-        draftMessage: "Quick follow-up based on your recent context and their latest update.",
-        evidence: contextLine.slice(0, 140),
-        confidence: 65,
-        immediateTasks: ["Draft outreach"],
-        humanTasks: ["Send message"]
-      });
-    }
-    return suggestions;
-  }
-
-  private buildFallbackTaskSuggestions(
-    count: number,
-    taskContext: string
-  ): Array<Omit<ProactiveSuggestion, "id" | "createdAt">> {
-    const lines = taskContext
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 24)
-      .slice(0, 12);
-
-    const suggestions: Array<Omit<ProactiveSuggestion, "id" | "createdAt">> = [];
-    for (let i = 0; i < count; i += 1) {
-      const evidence = lines[i % Math.max(1, lines.length)] || "Recent activity indicates pending action items.";
-      suggestions.push({
-        category: "project",
-        topic: `Priority Task ${i + 1}`,
-        summary: `Review and close: ${evidence.slice(0, 72)}`,
-        plan: `Detailed next steps:\n1. Validate the objective from memory evidence.\n2. Draft the concrete deliverable.\n3. Finalize and ship by end of day.\n\nEvidence:\n${evidence}`,
-        aiCompletedWork: `Prepared initial execution plan from memory evidence: ${evidence.slice(0, 120)}`,
-        immediateTasks: ["Draft deliverable", "Finalize output"],
-        humanTasks: ["Approve and send"],
-        evidence: evidence.slice(0, 140),
-        confidence: 70
-      });
-    }
-
-    return suggestions;
-  }
-
-  private isRelationshipSuggestion(suggestion: ProactiveSuggestion): boolean {
-    if (suggestion.category === "relationship") return true;
-    const topic = String(suggestion.topic || "").toLowerCase();
-    return this.RELATIONSHIP_TOPICS.has(topic) || Boolean(String(suggestion.contactName || "").trim());
-  }
-
-
-  private isHighQualitySuggestion(suggestion: Omit<ProactiveSuggestion, "id" | "createdAt">): boolean {
-    const summary = String(suggestion.summary || "").trim();
-    const plan = String(suggestion.plan || "").trim();
-    if (summary.length < 10 || plan.length < 15) return false;
-
-    const genericPattern = /(key task extraction|review tasks|top to-do|next task|priority workstream|untitled task)/i;
-    if (genericPattern.test(summary)) return false;
-
-    if (suggestion.category === "project") {
-      const actionVerbPattern = /^(draft|send|schedule|review|finalize|prepare|create|update|plan|call|email|ship|publish|write|organize|complete|fix|resolve|follow up|follow-up|sync|document)\b/i;
-      if (!actionVerbPattern.test(summary)) return false;
-    }
-
-    if (this.isRelationshipSuggestion({ ...suggestion, id: "tmp", createdAt: new Date().toISOString() })) {
-      if (!String(suggestion.contactName || "").trim()) return false;
-      if (!String(suggestion.draftMessage || "").trim()) return false;
-    }
-
-    const actions = (suggestion.immediateTasks || []).length + (suggestion.humanTasks || []).length;
-    return true; // Relaxed quality check to ensure suggestions are shown
-  }
-
-
-  private isCompletedSuggestion(suggestion: ProactiveSuggestion): boolean {
-    const completed = Array.isArray(suggestion.completedTasks) ? suggestion.completedTasks : [];
-    const allTasks = [...(suggestion.humanTasks || []), ...(suggestion.immediateTasks || [])];
-    if (allTasks.length === 0) return false;
-    return allTasks.every((task) => completed.includes(task));
-  }
-
-  private isCompletedToday(suggestion: ProactiveSuggestion): boolean {
-    if (!this.isCompletedSuggestion(suggestion)) return false;
-    if (!suggestion.completedAt) return false;
-    const completedDate = new Date(suggestion.completedAt);
-    if (!Number.isFinite(completedDate.getTime())) return false;
-    const now = new Date();
-    return completedDate.getFullYear() === now.getFullYear()
-      && completedDate.getMonth() === now.getMonth()
-      && completedDate.getDate() === now.getDate();
-  }
-
-  private suggestionSignature(topic: string, summary: string): string {
-    return `${String(topic || "").trim().toLowerCase()}|${String(summary || "").trim().toLowerCase()}`;
-  }
-
-  private async mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
-    if (items.length === 0) return [];
-    const results: R[] = [];
-    let index = 0;
-
-    const runWorker = async () => {
-      while (index < items.length) {
-        const current = items[index++];
-        results.push(await worker(current));
+        const evidenceSnippet = String(item.evidence || item.plan || "").replace(/\s+/g, " ").slice(0, 220);
+        results.push({
+          category: "project",
+          suggestionClass: item.suggestionClass || "momentum_opportunity",
+          topic,
+          summary,
+          whyNow: String(item.whyNow || "").trim() || undefined,
+          plan: String(item.plan || "").trim(),
+          evidence: String(item.evidence || "").slice(0, 180),
+          evidenceBundle: [{
+            id: `suggestion-${topic}-${summary}`,
+            kind: "memory",
+            title: summary,
+            snippet: evidenceSnippet,
+            reason: "Memory context supporting this proactive suggestion"
+          }],
+          confidence: Number(item.confidence) || 80,
+          nextAction: String(item.nextAction || item.immediateTasks?.[0] || "").trim() || undefined,
+          immediateTasks: Array.isArray(item.immediateTasks) ? item.immediateTasks.slice(0, 1).map(String) : [],
+          humanTasks: [],
+          noveltyKey: this.suggestionSignature(topic, summary),
+          sourceMix: ["memory"],
+          reasonIncluded: "Surfaced from recent work context and timing signals.",
+          supportingNodeIds: [],
+          supportingEventIds: [],
+          state: "active"
+        });
       }
-    };
+      return results;
+    } catch (e) {
+      console.error("[Proactive] Task generation failed:", e);
+      return [];
+    }
+  }
 
-    const runners = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => runWorker());
-    await Promise.all(runners);
-    return results;
+  private async buildMemoryContext(query: string): Promise<string> {
+    const sections: string[] = [];
+    try {
+      const { results, filters } = await this.retrieval.searchWithTrace(query, 20, { layers: ["RAW", "EPISODE", "INSIGHT", "SEMANTIC"] });
+      if (results.length > 0) {
+        sections.push(`RANKED MEMORY:\n${results.map((r) => `${r.title}: ${r.snippet}`).join("\n")}`);
+      }
+      const recent = await this.retrieval.getRecentContext(filters);
+      if (recent.trim()) {
+        sections.push(`RECENT TIMELINE:\n${recent}`);
+      }
+      const keywords = query.toLowerCase().match(/[a-z0-9]{4,}/g)?.slice(0, 8) || [];
+      const matchedEvents = this.db.searchEventsByKeywords(keywords, 25);
+      if (matchedEvents.length > 0) {
+        sections.push(`MATCHED RAW EVENTS:\n${matchedEvents.map((event) => `[${event.source}][${event.timestamp}] ${String(event.text || "").replace(/\s+/g, " ").slice(0, 220)}`).join("\n")}`);
+      }
+    } catch (e) {
+      console.warn("[Proactive] Retrieval failed:", e);
+    }
+
+    const recentRaw = this.db.getRecentEvents(80)
+      .map((e) => `${e.type}@${e.timestamp}: ${String(e.text || "").replace(/\s+/g, " ").slice(0, 220)}`)
+      .filter(Boolean)
+      .slice(0, 20)
+      .join("\n");
+    if (recentRaw) sections.push(`RECENT RAW EVENTS:\n${recentRaw}`);
+
+    const upcomingCalendar = this.db.getRecentEventsBySource("google_calendar", 12)
+      .slice(0, 5)
+      .map((event) => `[${event.timestamp}] ${String(event.text || "").replace(/\s+/g, " ").slice(0, 180)}`)
+      .join("\n");
+    if (upcomingCalendar) sections.push(`CALENDAR SIGNALS:\n${upcomingCalendar}`);
+
+    const recentEmailSignals = this.db.getRecentEventsBySource("google_gmail", 12)
+      .slice(0, 6)
+      .map((event) => `[${event.timestamp}] ${String(event.text || "").replace(/\s+/g, " ").slice(0, 180)}`)
+      .join("\n");
+    if (recentEmailSignals) sections.push(`EMAIL SIGNALS:\n${recentEmailSignals}`);
+
+    return sections.filter(Boolean).join("\n\n") || "No context available.";
   }
 
   private async getUserEmailStyleProfile(): Promise<string> {
-    const FRESH_MS = 6 * 60 * 60 * 1000;
-    if (this.cachedStyleProfile && (Date.now() - this.styleProfileUpdatedAt) < FRESH_MS) {
+    const freshMs = 6 * 60 * 60 * 1000;
+    if (this.cachedStyleProfile && Date.now() - this.styleProfileUpdatedAt < freshMs) {
       return this.cachedStyleProfile;
     }
 
@@ -646,8 +572,7 @@ Rules:
     if (sentSamples.length === 0) return "";
 
     try {
-      const prompt = `
-Analyze the writing style in these sent emails and return a compact style profile for drafting outreach in the same voice.
+      const prompt = `Analyze the writing style in these sent emails and return a compact style profile for drafting outreach in the same voice.
 
 Samples:
 ${sentSamples.join("\n---\n").slice(0, 10000)}
@@ -672,38 +597,133 @@ Return ONLY JSON:
     }
   }
 
-  private async rewriteInUserVoice(draft: string, styleProfile: string, contactName: string | undefined, sourceContext: string): Promise<string> {
+  private async rewriteInUserVoice(
+    draft: string,
+    styleProfile: string,
+    contactName: string | undefined,
+    sourceContext: string
+  ) {
     if (!draft.trim() || !styleProfile) return draft;
     try {
-      const prompt = `
-Rewrite this outreach opener to match the user's writing voice.
-Keep it concise and natural.
+      const prompt = `Rewrite this outreach opener to match the user's writing voice. Keep it concise, natural, and warm.
 
 Style profile:
 ${styleProfile}
 
-Contact:
-${contactName || "Unknown"}
-
-Context:
-${sourceContext.slice(0, 500)}
+Contact: ${contactName || "Unknown"}
+Context: ${sourceContext.slice(0, 500)}
 
 Draft:
 ${draft}
 
 Return only the rewritten opener text.`;
       const rewritten = await this.intelligence.generateDirectly(prompt);
-      const cleaned = String(rewritten || "").trim();
-      return cleaned || draft;
+      return String(rewritten || "").trim() || draft;
     } catch {
       return draft;
     }
   }
 
-  private inferContactName(sourceContext: string): string | undefined {
-    const text = String(sourceContext || "");
-    const matches = text.match(/\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b/g);
-    if (!matches || matches.length === 0) return undefined;
-    return matches[0];
+  private suggestionSignature(topic: string, summary: string) {
+    return `${String(topic || "").trim().toLowerCase()}|${String(summary || "").trim().toLowerCase()}`;
+  }
+
+  private recordSignatureHistory(suggestions: ProactiveSuggestion[]) {
+    const current = this.pruneHistory(this.db.kvGet<SignatureHistory>(this.SIGNATURE_HISTORY_KEY) || {}, SIGNATURE_RETENTION_MS);
+    const now = new Date().toISOString();
+    for (const suggestion of suggestions) {
+      current[this.suggestionSignature(suggestion.topic, suggestion.summary)] = now;
+    }
+    this.db.kvSet(this.SIGNATURE_HISTORY_KEY, this.limitHistory(current), "json");
+  }
+
+  private getRecentSignatureHistory() {
+    const current = this.pruneHistory(this.db.kvGet<SignatureHistory>(this.SIGNATURE_HISTORY_KEY) || {}, SIGNATURE_RETENTION_MS);
+    const cutoff = Date.now() - SIGNATURE_RETENTION_MS;
+    return Object.entries(current)
+      .filter(([, timestamp]) => new Date(timestamp).getTime() >= cutoff)
+      .map(([signature]) => signature);
+  }
+
+  private recordTopicRotation(suggestions: ProactiveSuggestion[]) {
+    const current = this.pruneHistory(this.db.kvGet<TopicRotation>(this.TOPIC_ROTATION_KEY) || {}, TOPIC_ROTATION_RETENTION_MS);
+    const now = new Date().toISOString();
+    for (const suggestion of suggestions) {
+      const key = this.topicRotationKey(suggestion);
+      current[key] = now;
+    }
+    this.db.kvSet(this.TOPIC_ROTATION_KEY, this.limitHistory(current), "json");
+  }
+
+  private isTopicRecentlySurfaced(suggestion: ProactiveSuggestion) {
+    const current = this.pruneHistory(this.db.kvGet<TopicRotation>(this.TOPIC_ROTATION_KEY) || {}, TOPIC_ROTATION_RETENTION_MS);
+    const stamp = current[this.topicRotationKey(suggestion)];
+    if (!stamp) return false;
+    const age = Date.now() - new Date(stamp).getTime();
+    return Number.isFinite(age) && age < TOPIC_ROTATION_RETENTION_MS;
+  }
+
+  private topicRotationKey(suggestion: ProactiveSuggestion) {
+    return [
+      suggestion.category || "project",
+      suggestion.suggestionClass || "general",
+      (suggestion.contactName || suggestion.topic || "").trim().toLowerCase()
+    ].join("|");
+  }
+
+  private isCoolingDown(suggestion: ProactiveSuggestion) {
+    if (!suggestion.createdAt) return false;
+    const age = Date.now() - new Date(suggestion.createdAt).getTime();
+    if (!Number.isFinite(age)) return false;
+    if (suggestion.state !== "active") return true;
+    const cooldownMs = suggestion.lane === "do_now" ? 90 * 60 * 1000 : 6 * 60 * 60 * 1000;
+    return age < cooldownMs;
+  }
+
+  private isCompletedSuggestion(suggestion: ProactiveSuggestion) {
+    if (suggestion.state === "completed" || suggestion.completedAt || suggestion.convertedRoutineId) return true;
+    const completed = Array.isArray(suggestion.completedTasks) ? suggestion.completedTasks : [];
+    const allTasks = [...(suggestion.humanTasks || []), ...(suggestion.immediateTasks || [])];
+    return allTasks.length > 0 && allTasks.every((task) => completed.includes(task));
+  }
+
+  private isCompletedToday(suggestion: ProactiveSuggestion) {
+    if (!this.isCompletedSuggestion(suggestion) || !suggestion.completedAt) return false;
+    const completed = new Date(suggestion.completedAt);
+    if (!Number.isFinite(completed.getTime())) return false;
+    const now = new Date();
+    return completed.getFullYear() === now.getFullYear()
+      && completed.getMonth() === now.getMonth()
+      && completed.getDate() === now.getDate();
+  }
+
+  private isDismissed(suggestion: ProactiveSuggestion) {
+    return suggestion.state === "dismissed" || Boolean(suggestion.dismissedAt);
+  }
+
+  private isSnoozed(suggestion: ProactiveSuggestion) {
+    return Boolean(suggestion.snoozedUntil) && new Date(String(suggestion.snoozedUntil)).getTime() > Date.now();
+  }
+
+  private canSpendBackgroundBudget() {
+    const captureHealth = this.db.getSubsystemHealth().capture || {};
+    const queueDepth = Number(captureHealth.queueDepth || 0);
+    const captureLagMs = Number(captureHealth.captureLagMs || 0);
+    return queueDepth < 4 && captureLagMs < 90_000;
+  }
+
+  private pruneHistory<T extends Record<string, string>>(history: T, retentionMs: number): T {
+    const cutoff = Date.now() - retentionMs;
+    return Object.fromEntries(
+      Object.entries(history).filter(([, timestamp]) => new Date(timestamp).getTime() >= cutoff)
+    ) as T;
+  }
+
+  private limitHistory<T extends Record<string, string>>(history: T): T {
+    return Object.fromEntries(
+      Object.entries(history)
+        .sort((left, right) => new Date(right[1]).getTime() - new Date(left[1]).getTime())
+        .slice(0, MAX_HISTORY_ENTRIES)
+    ) as T;
   }
 }

@@ -28,8 +28,8 @@ describe("redaction", () => {
 
 describe("blacklist", () => {
   it("matches bundle ids, app names, and titles", () => {
-    expect(isBlacklisted({ appName: "1Password" }, ["1password"])).toBe(true);
-    expect(isBlacklisted({ bundleId: "com.apple.Notes" }, ["bank"])).toBe(false);
-    expect(isBlacklisted({ title: "Business Banking" }, ["banking"])).toBe(true);
+    expect(isBlacklisted({ appName: "1Password" }, ["1password"], [])).toBe(true);
+    expect(isBlacklisted({ bundleId: "com.apple.Notes" }, ["bank"], [])).toBe(false);
+    expect(isBlacklisted({ title: "Business Banking" }, [], ["banking"])).toBe(true);
   });
 });

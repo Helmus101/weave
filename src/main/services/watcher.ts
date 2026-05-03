@@ -8,11 +8,25 @@ import type { VectorStore } from "./vectorStore";
 import type { DeepSeekService } from "./deepseek";
 
 export class WatcherService extends EventEmitter {
+  private readonly FULL_OCR_INTERVAL_MS = 2 * 60 * 1000;
   private timer?: NodeJS.Timeout;
+  private proactiveTimer?: NodeJS.Timeout;
   private state: CaptureState;
-  private lastWindowKey?: string;
   private systemPaused = false;
   private lastSynthesisAt = 0; // epoch ms — cooldown guard
+  private stopped = false;
+  private lifecycleGeneration = 0;
+  private captureInFlight = false;
+  private synthesisInFlight = false;
+  private historicalSynthesisInFlight = false;
+  private proactivePulseInFlight = false;
+  private skippedTicks = 0;
+  private deferredSynthesisCount = 0;
+  private indexInFlight = false;
+  private indexQueue: Array<{ nodeId: string; timestamp: string; app?: string; windowTitle?: string; text: string; result: OcrCaptureResult; generation: number }> = [];
+  private synthesisQueue: Array<{ nodeId: string; appName: string; rawText: string; force: boolean; generation: number }> = [];
+  private lastOcrSignature?: string;
+  private lastOcrSampleAt = 0;
 
   constructor(
     private db: WeaveDatabase,
@@ -33,7 +47,7 @@ export class WatcherService extends EventEmitter {
     
     // Proactive Search Daemon (Stage 6)
     // Run every 6 hours
-    setInterval(() => {
+    this.proactiveTimer = setInterval(() => {
       void this.runProactiveSearch();
     }, 6 * 60 * 60 * 1000);
   }
@@ -42,35 +56,48 @@ export class WatcherService extends EventEmitter {
     this.systemPaused = paused;
     console.log(`[Watcher] System power state changed: ${paused ? "Paused (Sleep/Lock)" : "Resumed"}`);
     if (!paused && this.captureEnabledProvider()) {
-      void this.captureTick();
+      void this.captureTick(false, this.lifecycleGeneration);
     }
   }
 
   start() {
     if (this.timer) return;
+    this.stopped = false;
+    this.lifecycleGeneration += 1;
+    const generation = this.lifecycleGeneration;
     this.timer = setInterval(() => {
-      void this.captureTick();
+      void this.captureTick(false, generation);
     }, 30_000);
-    if (this.captureEnabledProvider()) void this.captureTick();
+    if (this.captureEnabledProvider()) void this.captureTick(false, generation);
     
     // Run proactive search on startup too
     void this.runProactiveSearch();
   }
 
   stop() {
+    this.stopped = true;
+    this.lifecycleGeneration += 1;
     if (this.timer) clearInterval(this.timer);
+    if (this.proactiveTimer) clearInterval(this.proactiveTimer);
     this.timer = undefined;
+    this.proactiveTimer = undefined;
     this.update({ status: "idle" });
   }
 
   getState() {
+    this.refreshCadenceStatus();
     return this.state;
+  }
+
+  canRunBackgroundWork() {
+    const lag = this.computeCaptureLagMs() ?? 0;
+    return !this.captureInFlight && this.computeQueueDepth() < 6 && lag < 90_000;
   }
 
   setEnabled(enabled: boolean) {
     this.captureEnabledSetter(enabled);
     this.update({ enabled, status: enabled ? "running" : "paused" });
-    if (enabled) void this.captureTick();
+    if (enabled) void this.captureTick(false, this.lifecycleGeneration);
     return this.state;
   }
 
@@ -80,34 +107,66 @@ export class WatcherService extends EventEmitter {
   }
 
   async runNow() {
-    await this.captureTick(true);
+    await this.captureTick(true, this.lifecycleGeneration);
     return this.state;
   }
 
-  async synthesizeHistoricalBatch(nodes: any[]) {
-    console.log(`[Director] Starting historical batch synthesis for ${nodes.length} nodes...`);
-    
-    // Group by YYYY-MM
-    const grouped = new Map<string, any[]>();
-    for (const node of nodes) {
-      const dateStr = node.anchorAt || node.createdAt || new Date().toISOString();
-      const monthKey = dateStr.slice(0, 7); // YYYY-MM
-      if (!grouped.has(monthKey)) grouped.set(monthKey, []);
-      grouped.get(monthKey)!.push(node);
+  recordProbeResult(result: OcrCaptureResult) {
+    this.applyOcrState(result);
+
+    if (result.ok) {
+      this.update({ lastCaptureAt: result.timestamp, lastOcrAt: result.timestamp, cadenceStatus: "healthy" });
+      this.db.setSubsystemHealth("capture", {
+        lastSuccessAt: result.timestamp,
+        lastOcrAt: result.timestamp,
+        lastFailureAt: undefined,
+        lastFailureMessage: undefined,
+        cadenceStatus: "healthy",
+        queueDepth: this.computeQueueDepth(),
+        indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+        synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight),
+        skippedTicks: this.skippedTicks,
+        captureLagMs: this.computeCaptureLagMs()
+      });
+      return;
     }
 
-    // Process each month
-    for (const [month, monthNodes] of grouped.entries()) {
-      console.log(`[Director] Synthesizing historical episode for ${month} (${monthNodes.length} items)...`);
-      
-      // Sort chronologically and take up to 200 items to avoid blowing up context
-      monthNodes.sort((a, b) => new Date(a.anchorAt).getTime() - new Date(b.anchorAt).getTime());
-      const sampledNodes = monthNodes.slice(0, 200);
-      
-      const bullets = sampledNodes.map(n => `- [${n.anchorAt.slice(8, 10)}] ${n.title}: ${n.summary.slice(0, 100)}`);
-      const fullLog = bullets.join("\n").slice(0, 10000); // hard cap at ~10k chars
+    this.db.setSubsystemHealth("capture", {
+      lastFailureAt: new Date().toISOString(),
+      lastFailureMessage: result.error || "OCR capture failed"
+    });
+    this.refreshCadenceStatus();
+  }
 
-      const prompt = `
+  async synthesizeHistoricalBatch(nodes: any[]) {
+    if (this.historicalSynthesisInFlight) {
+      console.log("[Director] Historical synthesis already running. Skipping overlap.");
+      return;
+    }
+    this.historicalSynthesisInFlight = true;
+    console.log(`[Director] Starting historical batch synthesis for ${nodes.length} nodes...`);
+    try {
+      // Group by YYYY-MM
+      const grouped = new Map<string, any[]>();
+      for (const node of nodes) {
+        const dateStr = node.anchorAt || node.createdAt || new Date().toISOString();
+        const monthKey = dateStr.slice(0, 7); // YYYY-MM
+        if (!grouped.has(monthKey)) grouped.set(monthKey, []);
+        grouped.get(monthKey)!.push(node);
+      }
+
+      // Process each month
+      for (const [month, monthNodes] of grouped.entries()) {
+        console.log(`[Director] Synthesizing historical episode for ${month} (${monthNodes.length} items)...`);
+        
+        // Sort chronologically and take up to 200 items to avoid blowing up context
+        monthNodes.sort((a, b) => new Date(a.anchorAt).getTime() - new Date(b.anchorAt).getTime());
+        const sampledNodes = monthNodes.slice(0, 200);
+        
+        const bullets = sampledNodes.map(n => `- [${n.anchorAt.slice(8, 10)}] ${n.title}: ${n.summary.slice(0, 100)}`);
+        const fullLog = bullets.join("\n").slice(0, 10000); // hard cap at ~10k chars
+
+        const prompt = `
 You are the "Director of Human Memory". Summarize this historical data archive for the month of ${month}.
 This data contains calendar events and emails.
 
@@ -129,111 +188,168 @@ Return ONLY a JSON object:
   "primary_project": "Historical Archive"
 }`;
 
-      try {
-        const response = this.deepseek.hasApiKey() ? await this.deepseek.reason(prompt) : "";
-        const jsonMatch = response.match(/\{.*\}/s);
-        const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
-        
-        if (parsed) {
-          const data = this.normalizeEpisodeData(parsed, parsed, "Google Workspace", parsed.raw_summary_bullets, sampledNodes, month);
-          const episodeId = this.persistEpisode(data, sampledNodes);
-          await this.vectors.upsertInteraction(episodeId, `${data.narrative}\n${data.raw_summary_bullets.join("\n")}`, `${month}-01T00:00:00Z`, {
-            app: "Historical Sync",
-            windowTitle: `Archive ${month}`
-          });
+        try {
+          const response = this.deepseek.hasApiKey() ? await this.deepseek.reason(prompt) : "";
+          const jsonMatch = response.match(/\{.*\}/s);
+          const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+          
+          if (parsed) {
+            const data = this.normalizeEpisodeData(parsed, parsed, "Google Workspace", parsed.raw_summary_bullets, sampledNodes, month);
+            const episodeId = this.persistEpisode(data, sampledNodes);
+            await this.vectors.upsertInteraction(episodeId, `${data.narrative}\n${data.raw_summary_bullets.join("\n")}`, `${month}-01T00:00:00Z`, {
+              app: "Historical Sync",
+              windowTitle: `Archive ${month}`
+            });
+          }
+        } catch (e) {
+          console.error(`[Director] Failed historical synthesis for ${month}:`, e);
         }
-      } catch (e) {
-        console.error(`[Director] Failed historical synthesis for ${month}:`, e);
+        await this.yieldToEventLoop();
       }
+    } finally {
+      this.historicalSynthesisInFlight = false;
     }
   }
 
-  private async captureTick(force = false) {
-    if (!this.captureEnabledProvider() || this.systemPaused) {
-      this.update({ 
-        enabled: this.captureEnabledProvider(), 
-        status: this.systemPaused ? "idle" : "paused" 
+  private async captureTick(force = false, generation = this.lifecycleGeneration) {
+    if (this.captureInFlight && !force) {
+      this.skippedTicks += 1;
+      this.refreshCadenceStatus();
+      return;
+    }
+    const captureStartedAt = Date.now();
+    this.captureInFlight = true;
+    try {
+      if (!this.captureEnabledProvider() || this.systemPaused) {
+        this.update({ 
+          enabled: this.captureEnabledProvider(), 
+          status: this.systemPaused ? "idle" : "paused",
+          cadenceStatus: "paused"
+        });
+        return;
+      }
+
+      if (!this.isActiveGeneration(generation)) return;
+      this.update({ enabled: true, status: "running" });
+      const shouldRunFullCapture = force || await this.shouldRunFullCapture();
+      const ocrStartedAt = Date.now();
+      const result = shouldRunFullCapture ? await this.ocr.capture() : await this.ocr.status();
+      const ocrDurationMs = Date.now() - ocrStartedAt;
+      if (!this.isActiveGeneration(generation)) return;
+
+      this.recordProbeResult(result);
+      this.update({
+        ocrDurationMs,
+        captureDurationMs: Date.now() - captureStartedAt
       });
-      return;
-    }
+      this.db.setSubsystemHealth("capture", {
+        ocrDurationMs,
+        captureDurationMs: Date.now() - captureStartedAt,
+        queueDepth: this.computeQueueDepth(),
+        indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+        synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight)
+      });
 
-    this.update({ enabled: true, status: "running" });
-
-    const result = await this.ocr.capture();
-    this.applyOcrState(result);
-
-    if (!result.ok || !result.text.trim()) return;
-    const blacklist = this.blacklistProvider();
-    if (isBlacklisted(
-      { appName: result.activeApp, bundleId: result.activeBundleId, title: result.activeWindowTitle },
-      blacklist.apps,
-      blacklist.websites
-    )) {
-
-      this.update({ status: "blocked" });
-      return;
-    }
-
-    const windowKey = `${result.activeBundleId ?? result.activeApp ?? ""}:${result.activeWindowTitle ?? ""}:${result.text.slice(0, 120)}`;
-    if (!force && this.lastWindowKey === windowKey) return;
-    this.lastWindowKey = windowKey;
-
-    // 1. Store as Raw Event
-    const eventId = this.db.addEvent({
-      type: "ocr",
-      timestamp: result.timestamp,
-      source: result.activeApp ?? "unknown",
-      text: result.text,
-      metadata: {
-        bundleId: result.activeBundleId,
-        windowTitle: result.activeWindowTitle
+      if (!result.ok) return;
+      if (!shouldRunFullCapture) {
+        this.update({ lastCaptureAt: result.timestamp, cadenceStatus: "healthy" });
+        return;
       }
-    });
+      if (!result.text.trim()) return;
+      const blacklist = this.blacklistProvider();
+      if (isBlacklisted(
+        { appName: result.activeApp, bundleId: result.activeBundleId, title: result.activeWindowTitle },
+        blacklist.apps,
+        blacklist.websites
+      )) {
+        this.update({ status: "blocked" });
+        return;
+      }
 
-    // 2. Create RAW Layer Memory Node
-    const summary = summarizeLocally(result.text);
-    const nodeId = this.db.addMemoryNode({
-      layer: "RAW",
-      subtype: "screen_capture",
-      title: result.activeWindowTitle || result.activeApp || "Screen Capture",
-      summary: summary,
-      canonicalText: result.text,
-      sourceRefs: [eventId],
-      metadata: {
-        app: result.activeApp,
-        bundleId: result.activeBundleId
-      },
-      anchorAt: result.timestamp
-    });
+      if (!this.isActiveGeneration(generation)) return;
 
-    // 3. Update Vector Store with Semantic Prepending
-    await this.vectors.upsertInteraction(nodeId, `${summary}\n${result.text}`, result.timestamp, {
-      app: result.activeApp,
-      windowTitle: result.activeWindowTitle
-    });
-    
-    // 4. Detailed Memory Synthesis
-    await this.synthesizeDetailedMemory(nodeId, result.activeApp || "unknown", result.text);
+      // 1. Store as Raw Event
+      const summary = summarizeLocally(result.text);
+      const nodeId = this.db.writeBatch(() => {
+        const eventId = this.db.addEvent({
+          type: "ocr",
+          timestamp: result.timestamp,
+          source: result.activeApp ?? "unknown",
+          text: result.text,
+          metadata: {
+            bundleId: result.activeBundleId,
+            windowTitle: result.activeWindowTitle,
+            ocrBlocks: result.blocks
+          }
+        });
 
-    this.update({ lastCaptureAt: result.timestamp });
+        return this.db.addMemoryNode({
+          layer: "RAW",
+          subtype: "screen_capture",
+          title: result.activeWindowTitle || result.activeApp || "Screen Capture",
+          summary,
+          canonicalText: result.text,
+          sourceRefs: [eventId],
+          metadata: {
+            app: result.activeApp,
+            bundleId: result.activeBundleId,
+            windowTitle: result.activeWindowTitle,
+            ocrBlocks: result.blocks
+          },
+          anchorAt: result.timestamp
+        });
+      });
+      this.update({ lastIndexedAt: result.timestamp, lastIndexedNodeId: nodeId, cadenceStatus: "healthy" });
+      this.db.setSubsystemHealth("capture", {
+        lastIndexedAt: result.timestamp,
+        cadenceStatus: "healthy",
+        queueDepth: this.computeQueueDepth(),
+        indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+        synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight),
+        skippedTicks: this.skippedTicks,
+        captureLagMs: this.computeCaptureLagMs(),
+        retrievalCoverage: "raw node persisted"
+      });
+      this.lastOcrSignature = this.makeCaptureSignature(result);
+      this.lastOcrSampleAt = Date.now();
+      this.enqueueIndexWork({ nodeId, timestamp: result.timestamp, app: result.activeApp, windowTitle: result.activeWindowTitle, text: result.text, result, generation });
+      this.enqueueSynthesisWork({ nodeId, appName: result.activeApp || "unknown", rawText: result.text, force, generation });
+    } catch (error: any) {
+      if (!this.isActiveGeneration(generation) || this.isDatabaseClosedError(error)) {
+        return;
+      }
+      console.error("[Watcher] Capture tick failed:", error);
+      this.db.setSubsystemHealth("capture", {
+        lastFailureAt: new Date().toISOString(),
+        lastFailureMessage: error?.message || "Capture tick failed"
+      });
+      this.update({ status: "error", lastError: error?.message || "Capture tick failed" });
+    } finally {
+      this.captureInFlight = false;
+    }
   }
 
-  private async synthesizeDetailedMemory(nodeId: string, appName: string, rawText: string, force = false) {
-    const now = Date.now();
-    const COOLDOWN_MS = 60 * 60 * 1000; // 60 min between LLM synthesis calls
-    const MIN_CLUSTER_SIZE = force ? 1 : 10; // raise threshold from 5 → 10
-
-    const nodes = this.db.getMemoryNodes("RAW");
-    const recentCluster = nodes.filter(n =>
-      n.layer === "RAW" &&
-      (now - new Date(n.createdAt).getTime()) < 600_000 // 10 min window
-    );
-
-    if (recentCluster.length < MIN_CLUSTER_SIZE) return;
-    if (!force && now - this.lastSynthesisAt < COOLDOWN_MS) {
-      console.log("[Director] Synthesis skipped — cooldown active.");
+  private async synthesizeDetailedMemory(nodeId: string, appName: string, rawText: string, force = false, generation = this.lifecycleGeneration) {
+    if (this.synthesisInFlight && !force) {
+      this.deferredSynthesisCount += 1;
+      this.refreshCadenceStatus();
       return;
     }
+    try {
+      const now = Date.now();
+      const COOLDOWN_MS = 60 * 60 * 1000; // 60 min between LLM synthesis calls
+      const MIN_CLUSTER_SIZE = force ? 1 : 10; // raise threshold from 5 → 10
+
+      const recentCluster = this.db.getRecentRawNodes(120, {
+        dateStart: new Date(now - 600_000).toISOString()
+      });
+
+      if (recentCluster.length < MIN_CLUSTER_SIZE) return;
+      if (!force && now - this.lastSynthesisAt < COOLDOWN_MS) {
+        console.log("[Director] Synthesis skipped — cooldown active.");
+        return;
+      }
+      if (!this.isActiveGeneration(generation)) return;
       const orderedCluster = [...recentCluster].sort((a, b) =>
         new Date(a.anchorAt || a.createdAt).getTime() - new Date(b.anchorAt || b.createdAt).getTime()
       );
@@ -242,6 +358,8 @@ Return ONLY a JSON object:
 
       console.log(`[Director's Cut] Synthesizing ${recentCluster.length} snapshots into narrative Episode...`);
       this.lastSynthesisAt = now;
+      this.synthesisInFlight = true;
+      this.deferredSynthesisCount = Math.max(0, this.deferredSynthesisCount - 1);
       
       const appUsage: Record<string, number> = {};
       orderedCluster.forEach(n => {
@@ -307,24 +425,37 @@ Bullet Example:
 
       try {
         const response = this.deepseek.hasApiKey() ? await this.deepseek.reason(episodePrompt) : "";
+        if (!this.isActiveGeneration(generation)) return;
         const jsonMatch = response.match(/\{.*\}/s);
         const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
         const data = this.normalizeEpisodeData(parsed, fallbackEpisode, appSignature, evidenceBullets, orderedCluster, timeWindow);
+        if (!this.isActiveGeneration(generation)) return;
         const episodeId = this.persistEpisode(data, orderedCluster);
         await this.vectors.upsertInteraction(episodeId, `${data.narrative}\n${data.raw_summary_bullets.join("\n")}`, new Date().toISOString(), {
           app: data.primary_project || orderedCluster[orderedCluster.length - 1]?.metadata.app || appName,
           windowTitle: data.title
         });
+        if (!this.isActiveGeneration(generation)) return;
         this.linkEpisodeToSemanticProject(episodeId, data.primary_project, data.title);
       } catch (e) {
+        if (!this.isActiveGeneration(generation) || this.isDatabaseClosedError(e)) return;
         console.error("[Director] Synthesis failed:", e);
         const episodeId = this.persistEpisode(fallbackEpisode, orderedCluster);
         await this.vectors.upsertInteraction(episodeId, `${fallbackEpisode.narrative}\n${fallbackEpisode.raw_summary_bullets.join("\n")}`, new Date().toISOString(), {
           app: fallbackEpisode.primary_project || orderedCluster[orderedCluster.length - 1]?.metadata.app || appName,
           windowTitle: fallbackEpisode.title
         });
+        if (!this.isActiveGeneration(generation)) return;
         this.linkEpisodeToSemanticProject(episodeId, fallbackEpisode.primary_project, fallbackEpisode.title);
       }
+    } catch (error) {
+      if (!this.isActiveGeneration(generation) || this.isDatabaseClosedError(error)) {
+        return;
+      }
+      throw error;
+    } finally {
+      this.synthesisInFlight = false;
+    }
   }
 
   private hasEpisodeForCluster(rawSnapshotIds: string[]) {
@@ -407,12 +538,14 @@ Bullet Example:
 
   private persistEpisode(data: any, nodes: any[]) {
     const bullets = data.raw_summary_bullets.map((b: string) => `- ${b}`).join("\n");
-    const episodeId = this.db.addMemoryNode({
-      layer: "EPISODE",
-      subtype: String(data.behavioral.vibe || "episode").toLowerCase().replace(/\s+/g, "-"),
-      title: data.title,
-      summary: data.narrative,
-      canonicalText:
+    const episodeId = this.db.writeBatch(() => {
+      const createdId = this.db.addMemoryNode({
+        layer: "EPISODE",
+        subtype: String(data.behavioral.vibe || "episode").toLowerCase().replace(/\s+/g, "-"),
+        title: data.title,
+        summary: data.narrative,
+        sourceRefs: data.raw_snapshot_ids,
+        canonicalText:
 `NARRATIVE:
 ${data.narrative}
 
@@ -430,24 +563,26 @@ KEY ENTITIES:
 - Technical Nodes: ${(data.entities.technical_topics || []).join(", ") || "None"}
 - Status / Outcome: ${data.entities.status || "Unknown"}
 - Location / Context: ${data.entities.context || "Unknown"}`,
-      metadata: {
-        ...data.behavioral,
-        ...data.entities,
-        primary_project: data.primary_project,
-        snapshot_count: nodes.length,
-        raw_range: [nodes[0]?.id, nodes[nodes.length - 1]?.id],
-        raw_snapshot_ids: data.raw_snapshot_ids,
-        raw_summary_bullets: data.raw_summary_bullets,
-        time_window: data.time_window,
-        app: "Episode Synthesis"
-      },
-      importance: data.behavioral.focus_score > 7 ? 8 : 6,
-      anchorAt: nodes[nodes.length - 1]?.anchorAt || new Date().toISOString()
-    });
+        metadata: {
+          ...data.behavioral,
+          ...data.entities,
+          primary_project: data.primary_project,
+          snapshot_count: nodes.length,
+          raw_range: [nodes[0]?.id, nodes[nodes.length - 1]?.id],
+          raw_snapshot_ids: data.raw_snapshot_ids,
+          raw_summary_bullets: data.raw_summary_bullets,
+          time_window: data.time_window,
+          app: "Episode Synthesis"
+        },
+        importance: data.behavioral.focus_score > 7 ? 8 : 6,
+        anchorAt: nodes[nodes.length - 1]?.anchorAt || new Date().toISOString()
+      });
 
-    for (const node of nodes) {
-      this.db.addMemoryEdge(node.id, episodeId, "PART_OF_EPISODE");
-    }
+      for (const node of nodes) {
+        this.db.addMemoryEdge(node.id, createdId, "PART_OF_EPISODE");
+      }
+      return createdId;
+    });
 
     return episodeId;
   }
@@ -460,19 +595,26 @@ KEY ENTITIES:
       return;
     }
 
-    const semanticId = this.db.addMemoryNode({
-      layer: "SEMANTIC",
-      subtype: "topic",
-      title: topicName,
-      summary: `Project identified via Episode: ${title}`,
-      canonicalText: `Top-level concept for ${topicName}.`,
-      importance: 7,
-      metadata: { type: "Project", app: "Episode Synthesis" }
+    this.db.writeBatch(() => {
+      const semanticId = this.db.addMemoryNode({
+        layer: "SEMANTIC",
+        subtype: "topic",
+        title: topicName,
+        summary: `Project identified via Episode: ${title}`,
+        canonicalText: `Top-level concept for ${topicName}.`,
+        importance: 7,
+        metadata: { type: "Project", app: "Episode Synthesis" }
+      });
+      this.db.addMemoryEdge(episodeId, semanticId, "CONTRIBUTES_TO");
     });
-    this.db.addMemoryEdge(episodeId, semanticId, "CONTRIBUTES_TO");
   }
 
   private async runProactiveSearch() {
+    if (this.proactivePulseInFlight) {
+      return;
+    }
+    this.proactivePulseInFlight = true;
+    try {
     console.log("[Proactive] Running background pulse...");
     
     // Stage 6.1: Social Decay Pulse Pulse
@@ -498,6 +640,13 @@ KEY ENTITIES:
         }
       }
     }
+    } finally {
+      this.proactivePulseInFlight = false;
+    }
+  }
+
+  private async yieldToEventLoop() {
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
 
   private applyOcrState(result: OcrCaptureResult) {
@@ -511,8 +660,186 @@ KEY ENTITIES:
     });
   }
 
+  private persistActivitySpan(rawNodeId: string, result: OcrCaptureResult) {
+    const app = result.activeApp || "unknown";
+    const windowTitle = result.activeWindowTitle || "Untitled";
+    const recentThreshold = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const recentSpan = this.db
+      .getRecentEpisodeNodes(20, { dateStart: recentThreshold, app, windowTitle, subtype: "activity_span" })
+      .find((node) =>
+        node.metadata?.app === app &&
+        node.metadata?.windowTitle === windowTitle &&
+        (node.anchorAt || node.createdAt) >= recentThreshold
+      );
+
+    if (!recentSpan) {
+      this.db.writeBatch(() => {
+        const spanId = this.db.addMemoryNode({
+          layer: "EPISODE",
+          subtype: "activity_span",
+          title: `${app} activity span`,
+          summary: `${app} in ${windowTitle}`,
+          canonicalText: String(result.text || "").slice(0, 4000),
+          sourceRefs: [rawNodeId],
+          metadata: {
+            app,
+            windowTitle,
+            startAt: result.timestamp,
+            endAt: result.timestamp,
+            rawSnapshotIds: [rawNodeId]
+          },
+          importance: 5,
+          anchorAt: result.timestamp
+        });
+        this.db.addMemoryEdge(rawNodeId, spanId, "PART_OF_SPAN");
+      });
+      return;
+    }
+
+    const rawSnapshotIds = Array.isArray(recentSpan.metadata?.rawSnapshotIds) ? recentSpan.metadata.rawSnapshotIds : [];
+    const nextRawSnapshotIds = [...new Set([...rawSnapshotIds, rawNodeId])];
+    const nextText = `${String(recentSpan.canonicalText || "")}\n\n[${result.timestamp}] ${String(result.text || "").slice(0, 1200)}`.slice(0, 12000);
+    this.db.writeBatch(() => {
+      this.db.updateMemoryNode(recentSpan.id, {
+        summary: `${app} in ${windowTitle} · ${nextRawSnapshotIds.length} captures`,
+        canonicalText: nextText,
+        metadata: {
+          ...recentSpan.metadata,
+          app,
+          windowTitle,
+          endAt: result.timestamp,
+          rawSnapshotIds: nextRawSnapshotIds
+        }
+      });
+      this.db.addMemoryEdge(rawNodeId, recentSpan.id, "PART_OF_SPAN");
+    });
+  }
+
+  private refreshCadenceStatus() {
+    const cadenceStatus = this.computeCadenceStatus();
+    this.state = {
+      ...this.state,
+      cadenceStatus,
+      queueDepth: this.computeQueueDepth(),
+      indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+      synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight),
+      skippedTicks: this.skippedTicks,
+      captureLagMs: this.computeCaptureLagMs()
+    };
+    this.db.setSubsystemHealth("capture", {
+      cadenceStatus,
+      lastOcrAt: this.state.lastOcrAt,
+      lastIndexedAt: this.state.lastIndexedAt,
+      queueDepth: this.computeQueueDepth(),
+      indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+      synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight),
+      skippedTicks: this.skippedTicks,
+      captureLagMs: this.computeCaptureLagMs(),
+      ocrDurationMs: this.state.ocrDurationMs,
+      captureDurationMs: this.state.captureDurationMs
+    });
+  }
+
+  private computeCadenceStatus() {
+    if (!this.captureEnabledProvider() || this.systemPaused) return "paused" as const;
+    if (!this.state.lastOcrAt) return "stale" as const;
+    const ageMs = Date.now() - new Date(this.state.lastOcrAt).getTime();
+    return ageMs > 45_000 ? "stale" : "healthy";
+  }
+
   private update(partial: Partial<CaptureState>) {
     this.state = { ...this.state, ...partial };
     this.emit("state", this.state);
+  }
+
+  private computeQueueDepth() {
+    return Number(this.captureInFlight)
+      + Number(this.indexInFlight)
+      + Number(this.synthesisInFlight)
+      + Number(this.historicalSynthesisInFlight)
+      + Number(this.proactivePulseInFlight)
+      + this.indexQueue.length
+      + this.synthesisQueue.length
+      + this.deferredSynthesisCount;
+  }
+
+  private computeCaptureLagMs() {
+    if (!this.state.lastOcrAt) return undefined;
+    const lag = Date.now() - new Date(this.state.lastOcrAt).getTime();
+    return Number.isFinite(lag) ? Math.max(0, lag) : undefined;
+  }
+
+  private isActiveGeneration(generation: number) {
+    return !this.stopped && generation === this.lifecycleGeneration;
+  }
+
+  private isDatabaseClosedError(error: unknown) {
+    const message = String((error as any)?.message || error || "").toLowerCase();
+    return message.includes("database closed");
+  }
+
+  private async shouldRunFullCapture() {
+    const status = await this.ocr.status();
+    this.applyOcrState(status);
+    if (!status.ok) return false;
+    const currentSignature = this.makeCaptureSignature(status);
+    const stale = Date.now() - this.lastOcrSampleAt >= this.FULL_OCR_INTERVAL_MS;
+    return !this.lastOcrSignature || currentSignature !== this.lastOcrSignature || stale;
+  }
+
+  private makeCaptureSignature(result: Pick<OcrCaptureResult, "activeApp" | "activeBundleId" | "activeWindowTitle">) {
+    return [result.activeBundleId || "", result.activeApp || "", result.activeWindowTitle || ""].join("|");
+  }
+
+  private enqueueIndexWork(job: { nodeId: string; timestamp: string; app?: string; windowTitle?: string; text: string; result: OcrCaptureResult; generation: number }) {
+    this.indexQueue.push(job);
+    void this.processIndexQueue();
+    this.refreshCadenceStatus();
+  }
+
+  private enqueueSynthesisWork(job: { nodeId: string; appName: string; rawText: string; force: boolean; generation: number }) {
+    this.synthesisQueue.push(job);
+    void this.processSynthesisQueue();
+    this.refreshCadenceStatus();
+  }
+
+  private async processIndexQueue() {
+    if (this.indexInFlight) return;
+    this.indexInFlight = true;
+    try {
+      while (this.indexQueue.length > 0) {
+        const job = this.indexQueue.shift();
+        if (!job || !this.isActiveGeneration(job.generation)) continue;
+        const startedAt = Date.now();
+        this.persistActivitySpan(job.nodeId, job.result);
+        await this.vectors.upsertInteraction(job.nodeId, `${summarizeLocally(job.text)}\n${job.text}`, job.timestamp, {
+          app: job.app,
+          windowTitle: job.windowTitle
+        });
+        this.db.setSubsystemHealth("capture", {
+          lastIndexedAt: job.timestamp,
+          queueDepth: this.computeQueueDepth(),
+          indexQueueDepth: this.indexQueue.length + Number(this.indexInFlight),
+          synthesisQueueDepth: this.synthesisQueue.length + Number(this.synthesisInFlight),
+          retrievalCoverage: "raw node indexed",
+          captureDurationMs: Math.max(this.state.captureDurationMs || 0, Date.now() - startedAt)
+        });
+        await this.yieldToEventLoop();
+      }
+    } finally {
+      this.indexInFlight = false;
+      this.refreshCadenceStatus();
+    }
+  }
+
+  private async processSynthesisQueue() {
+    if (this.synthesisInFlight) return;
+    while (this.synthesisQueue.length > 0) {
+      const job = this.synthesisQueue.shift();
+      if (!job || !this.isActiveGeneration(job.generation)) continue;
+      await this.synthesizeDetailedMemory(job.nodeId, job.appName, job.rawText, job.force, job.generation);
+      await this.yieldToEventLoop();
+    }
+    this.refreshCadenceStatus();
   }
 }

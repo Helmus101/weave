@@ -1,3 +1,4 @@
+import { app } from "electron";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
@@ -26,7 +27,15 @@ export interface OcrCaptureResult {
 export class OcrBridge {
   constructor(private binaryPath: string) {}
 
+  async status(): Promise<OcrCaptureResult> {
+    return this.exec("permission");
+  }
+
   async capture(savePath?: string): Promise<OcrCaptureResult> {
+    return this.exec("capture", savePath ? [savePath] : []);
+  }
+
+  private async exec(command: "capture" | "permission", extraArgs: string[] = []): Promise<OcrCaptureResult> {
     if (!fs.existsSync(this.binaryPath)) {
       return {
         ok: false,
@@ -34,14 +43,14 @@ export class OcrBridge {
         blocks: [],
         timestamp: new Date().toISOString(),
         permission: "unknown",
-        error: `OCR bridge is not built. Run npm run build:ocr.`
+        error: app.isPackaged
+          ? "OCR helper is missing from the app package."
+          : "OCR bridge is not built. Run npm run build:ocr."
       };
     }
 
     try {
-      const args = ["capture"];
-      if (savePath) args.push(savePath);
-      
+      const args = [command, ...extraArgs];
       const { stdout } = await execFileAsync(this.binaryPath, args, { timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
       return JSON.parse(stdout) as OcrCaptureResult;
     } catch (error) {

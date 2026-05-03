@@ -7,6 +7,7 @@ export interface AppPaths {
   dbPath: string;
   vectorPath: string;
   ocrBinaryPath: string;
+  appleContactsBinaryPath: string;
 }
 
 export function getAppPaths(): AppPaths {
@@ -17,11 +18,15 @@ export function getAppPaths(): AppPaths {
   const ocrBinaryPath = app.isPackaged
     ? path.join(process.resourcesPath, "native", "ocr", "weave-ocr")
     : path.join(process.cwd(), "native", "ocr", "weave-ocr");
+  const appleContactsBinaryPath = app.isPackaged
+    ? path.join(process.resourcesPath, "native", "contacts", "fetch_apple_contacts")
+    : path.join(process.cwd(), "src", "main", "scripts", "fetch_apple_contacts");
 
   return {
     userData,
     dbPath: path.join(dataDir, "weave.sqlite"),
     vectorPath: path.join(dataDir, "vectors"),
-    ocrBinaryPath
+    ocrBinaryPath,
+    appleContactsBinaryPath
   };
 }

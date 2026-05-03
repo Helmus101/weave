@@ -2,7 +2,11 @@ import type { WeaveDatabase } from "../db/client";
 import type { DeepSeekService } from "./deepseek";
 
 export class ResearchService {
-  constructor(private db: WeaveDatabase, private deepseek?: DeepSeekService) {}
+  constructor(
+    private db: WeaveDatabase,
+    private deepseek?: DeepSeekService,
+    private canUseExternalResearch: () => boolean = () => false
+  ) {}
   private queue: Array<{ personNodeId: string; name: string }> = [];
   private queuedPersonIds = new Set<string>();
   private inFlightPersonIds = new Set<string>();
@@ -22,6 +26,7 @@ export class ResearchService {
   }
 
   async enrichPerson(personNodeId: string, name: string) {
+    if (!this.canUseExternalResearch()) return;
     const person = this.db.getMemoryNode(personNodeId);
     if (!person) return;
 
@@ -171,6 +176,7 @@ Return ONLY JSON:`;
   }
 
   private async enqueueStalePeopleForRefresh() {
+    if (!this.canUseExternalResearch()) return;
     const people = this.db.getMemoryNodes("SEMANTIC").filter((node) => node.subtype === "person");
     const due = people
       .filter((person) => {
@@ -239,5 +245,13 @@ Return ONLY JSON array of 3 strings.
 
   private async delay(ms: number) {
     await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  stop() {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = undefined;
+    this.queue = [];
+    this.queuedPersonIds.clear();
+    this.inFlightPersonIds.clear();
   }
 }

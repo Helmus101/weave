@@ -34,6 +34,7 @@ const baseStatements = [
     canonical_text TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     status TEXT NOT NULL DEFAULT 'active',
+    source_refs TEXT,
     importance INTEGER NOT NULL DEFAULT 5,
     connection_count INTEGER NOT NULL DEFAULT 0,
     last_reheated TEXT,
@@ -160,6 +161,7 @@ export function runMigrations(sqlite: initSqlJs.Database) {
   }
 
   ensureChatRetrievalTraceColumn(sqlite);
+  ensureMemoryNodeSourceRefsColumn(sqlite);
 
   const supportsFts5 = hasFts5(sqlite);
   for (const statement of cleanupFtsStatements) {
@@ -175,6 +177,18 @@ export function runMigrations(sqlite: initSqlJs.Database) {
     console.info("[Database] FTS5 unavailable in this runtime. Search will use standard LIKE queries (slower).");
   }
 
+}
+
+function ensureMemoryNodeSourceRefsColumn(sqlite: initSqlJs.Database) {
+  try {
+    const result = sqlite.exec("PRAGMA table_info(memory_nodes)");
+    const columns = result[0]?.values?.map((row) => String(row[1])) ?? [];
+    if (!columns.includes("source_refs")) {
+      sqlite.run("ALTER TABLE memory_nodes ADD COLUMN source_refs TEXT");
+    }
+  } catch (error) {
+    console.warn("[Database] Failed to verify memory_nodes schema.", error);
+  }
 }
 
 function ensureChatRetrievalTraceColumn(sqlite: initSqlJs.Database) {

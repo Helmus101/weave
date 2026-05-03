@@ -1,7 +1,7 @@
 import type { RetrievalService, SearchTrace } from "./retrieval";
 import type { DeepSeekService } from "./deepseek";
 import type { WeaveDatabase } from "../db/client";
-import type { ChatRetrievalTrace } from "../../shared/types";
+import type { ChatRetrievalTrace, SourceReceipt } from "../../shared/types";
 import type { VectorStore } from "./vectorStore";
 
 export class IntelligenceEngine {
@@ -36,6 +36,9 @@ export class IntelligenceEngine {
     let webContext = "";
     let trace: SearchTrace | null = null;
     let filters: any = null;
+    let memoryReceipts: SourceReceipt[] = [];
+    let rawReceipts: SourceReceipt[] = [];
+    let webReceipts: SourceReceipt[] = [];
     const retrievalTrace: ChatRetrievalTrace = {
       intent,
       filters: null,
@@ -70,7 +73,16 @@ export class IntelligenceEngine {
         }
       },
       memoryNodes: [],
-      webQuery: intent.optimizedQuery
+      webQuery: intent.optimizedQuery,
+      rawNodeIds: [],
+      rawEventIds: [],
+      webSources: [],
+      evidence: {
+        sourceMix: [],
+        memoryReceipts: [],
+        rawReceipts: [],
+        webReceipts: []
+      }
     };
 
     let recent = "";
@@ -101,6 +113,8 @@ export class IntelligenceEngine {
           expandedCandidateCount: trace.expandedCandidateCount,
           finalNodeTitles: trace.goldSet
         };
+        memoryReceipts = this.retrieval.buildMemoryReceipts(searchRes.results);
+        rawReceipts = this.retrieval.buildRawReceipts(searchRes.results);
         
         memoryContext = searchRes.results.map(r => {
           const node = this.db.getMemoryNode(r.nodeId);
@@ -114,7 +128,9 @@ export class IntelligenceEngine {
       }
 
       onStep?.(`Searching the web for: ${intent.optimizedQuery}...`);
-      webContext = await this.retrieval.performWebSearch(intent.optimizedQuery);
+      const webResult = await this.retrieval.performWebSearchDetailed(intent.optimizedQuery);
+      webContext = webResult.text;
+      webReceipts = webResult.receipts;
 
       onStep?.("Accessing recent live snapshots...");
       recent = await this.retrieval.getRecentContext(filters);
@@ -135,8 +151,21 @@ export class IntelligenceEngine {
     const recentMsgs = this.db.getChatMessages(sessionId).slice(-5);
     const chatContext = recentMsgs.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
 
-    const core = this.db.getCoreIdentity();
-    const coreContext = JSON.stringify(core, null, 2);
+    const core = this.getNormalizedCoreIdentity();
+    const coreContext = this.formatCoreContext(core);
+    const receiptsSection = this.formatReceiptsForPrompt(memoryReceipts, rawReceipts, webReceipts);
+    retrievalTrace.evidence = {
+      sourceMix: [
+        ...(memoryReceipts.length || rawReceipts.length ? ["memory" as const] : []),
+        ...(webReceipts.length ? ["web" as const] : [])
+      ],
+      memoryReceipts,
+      rawReceipts,
+      webReceipts
+    };
+    retrievalTrace.memoryNodes = memoryReceipts.map((receipt) => receipt.title);
+    retrievalTrace.rawNodeIds = rawReceipts.map((receipt) => receipt.nodeId).filter(Boolean) as string[];
+    retrievalTrace.webSources = webReceipts;
 
     const prompt = `
 I operate under a set of core System Instructions that define my identity, my technical capabilities, and how I should interact with the user.
@@ -193,6 +222,9 @@ ${webContext || "No web results found."}
 ### RECENT ACTIVITY:
 ${recent}
 
+### EVIDENCE RECEIPTS:
+${receiptsSection}
+
 ### USER MESSAGE:
 ${message}
 
@@ -209,6 +241,7 @@ ${isTaskPlanningQuery
 - Ensure the response feels highly technical, deeply thorough, and personality-driven.
 - Reference the USER HANDBOOK if the message relates to their mission, skills, or preferences.
 - If web results were used, synthesize them with memory context for a hybrid answer.
+- Include inline receipts when making factual claims, using the evidence labels already provided.
 - VERY IMPORTANT: When mentioning a specific person from the user's contacts or memory, do NOT just write their name. You MUST format their name as exactly: \`@Contact[Name](Context or detail about them)\`. Example: \`@Contact[John Doe](Colleague from Engineering)\`. This will render a profile card in the UI.
 - WHITE-LABEL RULE: Never mention "DeepSeek", "DuckDuckGo", or any specific LLM/search provider by name. You are Weave.
 
@@ -223,7 +256,9 @@ Reasoning:`;
       console.error("[Intelligence] Final synthesis failed:", error);
     }
     if (!response || response.trim() === "I'm sorry, I couldn't process that memory right now.") {
-      response = this.buildFallbackResponse(message, memoryContext, webContext, recent);
+      response = this.buildFallbackResponse(message, memoryReceipts, rawReceipts, webReceipts, recent);
+    } else {
+      response = this.ensureReceiptCoverage(response, memoryReceipts, rawReceipts, webReceipts);
     }
     
     // Auto-rename chat if it's the first message and has a generic title
@@ -270,7 +305,17 @@ Reasoning:`;
         canonicalText: response,
         importance: 6,
         anchorAt: new Date().toISOString(),
-        metadata: { sessionId, role: "assistant", type: "chat_synthesis", app: "Weave Chat" }
+        metadata: {
+          sessionId,
+          role: "assistant",
+          type: "chat_synthesis",
+          app: "Weave Chat",
+          receipts: retrievalTrace.evidence
+        },
+        sourceRefs: [
+          ...(retrievalTrace.rawNodeIds || []),
+          ...memoryReceipts.map((receipt) => receipt.nodeId).filter(Boolean) as string[]
+        ]
       });
       await this.vectors.upsertInteraction(responseNodeId, response, new Date().toISOString(), {
         app: "Weave Chat",
@@ -281,8 +326,9 @@ Reasoning:`;
     }
 
     // Self-Update: only run every 5th message to save credits
+    this.learnPreferencesFromTurn(message, response);
     this.messageCount++;
-    if (this.messageCount % 5 === 0) {
+    if (this.messageCount % 3 === 0) {
       void this.analyzeAndUpdateCore(message, response);
     }
     
@@ -312,10 +358,10 @@ Reasoning:`;
 
   private async analyzeAndUpdateCore(userMsg: string, aiRes: string) {
     try {
-      const core = this.db.getCoreIdentity();
+      const core = this.getNormalizedCoreIdentity();
       const prompt = `
 Based on this interaction, should the User Handbook (Core Identity) be updated? 
-Look for new skills, recurring patterns, changed preferences, or life updates (e.g. "I moved to Berlin").
+Look for new skills, recurring patterns, changed preferences, workflow habits, response-format preferences, or life updates (e.g. "I moved to Berlin").
 
 Current Handbook:
 ${JSON.stringify(core, null, 2)}
@@ -324,8 +370,16 @@ Interaction:
 User: ${userMsg}
 AI: ${aiRes}
 
-If an update is needed, return a JSON object with ONLY the keys that changed/added. 
-Example: {"identity": {"skills": ["Existing", "New Skill"]}, "preferences": {"new_pref": "value"}}
+If an update is needed, return a JSON object with ONLY the keys that changed or were added.
+Prefer this structure when relevant:
+{
+  "identity": { "skills": ["..."], "mission": ["..."] },
+  "preferences": {
+    "communication": { "verbosity": "concise", "tone": ["direct"] },
+    "workflow": { "prioritization": ["high conviction"], "automation": ["scheduled briefings"] },
+    "routines": { "favorite_briefings": ["Morning Briefing"] }
+  }
+}
 If no update needed, return "NONE".
 
 Return ONLY JSON or "NONE":`;
@@ -334,12 +388,11 @@ Return ONLY JSON or "NONE":`;
       if (response.trim() !== "NONE") {
         const jsonMatch = response.match(/\{.*\}/s);
         if (jsonMatch) {
-          const updates = JSON.parse(jsonMatch[0]);
+          const updates = JSON.parse(jsonMatch[0]) as Record<string, any>;
+          const coreMap = core as Record<string, any>;
           for (const [key, value] of Object.entries(updates)) {
-            const existing = core[key] || {};
-            const merged = (typeof value === 'object' && !Array.isArray(value)) 
-              ? { ...existing, ...value } 
-              : value;
+            const existing = coreMap[key] || {};
+            const merged = this.deepMerge(existing, value);
             this.db.setCoreIdentity(key, merged);
           }
           console.log("[Intelligence] Core Identity updated based on conversation.");
@@ -433,27 +486,17 @@ Return ONLY JSON:`;
     return this.deepseek.reason(prompt);
   }
 
-  private buildFallbackResponse(message: string, memoryContext: string, webContext: string, recent: string): string {
+  private buildFallbackResponse(message: string, memoryReceipts: SourceReceipt[], rawReceipts: SourceReceipt[], webReceipts: SourceReceipt[], recent: string): string {
     const sections: string[] = [];
-    sections.push(`I could not use the primary model response path, so this answer is synthesized from the retrieved context for: ${message}`);
-
-    if (memoryContext.trim()) {
-      sections.push(`Memory context:\n${this.compactLines(memoryContext, 6)}`);
-    } else {
-      sections.push("Memory context:\nNo memory results were available for this query.");
-    }
-
-    if (webContext.trim()) {
-      sections.push(`Web context:\n${this.compactLines(webContext, 6)}`);
-    } else {
-      sections.push("Web context:\nNo web results were available for this query.");
-    }
+    sections.push(`Primary generation was unavailable, so this answer is built directly from the retrieved evidence for: ${message}`);
+    sections.push(`Memory receipts:\n${this.formatReceiptLines([...memoryReceipts, ...rawReceipts], 8) || "No memory receipts were available."}`);
+    sections.push(`Web receipts:\n${this.formatReceiptLines(webReceipts, 4) || "No web receipts were available."}`);
 
     if (recent.trim()) {
       sections.push(`Recent activity:\n${this.compactLines(recent, 6)}`);
     }
 
-    sections.push("Answer:\nThe retrieval pipeline completed and the available evidence is shown above. If you want a more polished answer, check the model/API configuration, but the search results are already being returned and stored.");
+    sections.push("Answer:\nThe retrieval pipeline completed and the strongest available receipts are shown above. You can rely on those records even though the primary synthesis path was unavailable.");
     return sections.join("\n\n");
   }
 
@@ -481,11 +524,200 @@ HIERARCHICAL RETRIEVAL TRACE (ASCII ONLY)
 - Vector Candidates: ${trace.vectorResultsCount}
 - BM25 Candidates: ${trace.bm25ResultsCount}
 - Filtered Gold Set: ${trace.goldSet.length} nodes
+- Raw Evidence Nodes: ${trace.rawEvidenceCount || 0}
+- Exact Raw Matches: ${trace.exactMatchCount || 0}
+- Timeline Expansions: ${trace.timelineExpansionCount || 0}
+- Coverage: ${trace.coverageSummary || "unknown"}
 
 GOLD SET NODES:
 ${trace.goldSet.map((title: string, i: number) => `(${i + 1}) ${title}`).join("\n")}
     `.trim();
 
     return rawTrace;
+  }
+
+  private formatReceiptsForPrompt(memoryReceipts: SourceReceipt[], rawReceipts: SourceReceipt[], webReceipts: SourceReceipt[]) {
+    const memory = this.formatReceiptLines(memoryReceipts, 5) || "No high-level memory receipts.";
+    const raw = this.formatReceiptLines(rawReceipts, 5) || "No raw OCR receipts.";
+    const web = this.formatReceiptLines(webReceipts, 5) || "No web receipts.";
+    return `MEMORY:\n${memory}\n\nRAW:\n${raw}\n\nWEB:\n${web}`;
+  }
+
+  private formatReceiptLines(receipts: SourceReceipt[], limit: number) {
+    return receipts.slice(0, limit).map((receipt) => {
+      if (receipt.kind === "web") {
+        return `[Web][${receipt.title}] ${receipt.snippet}${receipt.url ? ` (${receipt.url})` : ""}`;
+      }
+      return `[Memory][${receipt.app || receipt.layer || "unknown"}][${receipt.timestamp || "unknown"}] ${receipt.title}: ${receipt.snippet}`;
+    }).join("\n");
+  }
+
+  private ensureReceiptCoverage(response: string, memoryReceipts: SourceReceipt[], rawReceipts: SourceReceipt[], webReceipts: SourceReceipt[]) {
+    const hasReceiptMarkers = response.includes("[Memory]") || response.includes("[Web]");
+    if (hasReceiptMarkers) return response;
+    const receiptSection = [
+      this.formatReceiptLines([...memoryReceipts, ...rawReceipts], 4),
+      this.formatReceiptLines(webReceipts, 2)
+    ].filter(Boolean).join("\n");
+    if (!receiptSection) return response;
+    return `${response}\n\nRECEIPTS\n${receiptSection}`;
+  }
+
+  private getNormalizedCoreIdentity() {
+    const raw = this.db.getCoreIdentity() || {};
+    return {
+      identity: raw.identity || {},
+      preferences: {
+        communication: raw.preferences?.communication || {},
+        workflow: raw.preferences?.workflow || {},
+        routines: raw.preferences?.routines || {},
+        product: raw.preferences?.product || {}
+      },
+      preferenceSignals: Array.isArray(raw.preferenceSignals) ? raw.preferenceSignals.slice(-25) : [],
+      contextDefaults: raw.contextDefaults || {}
+    };
+  }
+
+  private formatCoreContext(core: Record<string, any>) {
+    const lines: string[] = [];
+    const identity = core.identity || {};
+    const preferences = core.preferences || {};
+    const communication = preferences.communication || {};
+    const workflow = preferences.workflow || {};
+    const routines = preferences.routines || {};
+    const product = preferences.product || {};
+    const signals = Array.isArray(core.preferenceSignals) ? core.preferenceSignals.slice(-10) : [];
+
+    lines.push("IDENTITY");
+    lines.push(JSON.stringify(identity, null, 2));
+    lines.push("");
+    lines.push("ACTIVE PREFERENCES");
+    lines.push(JSON.stringify({
+      communication,
+      workflow,
+      routines,
+      product
+    }, null, 2));
+    if (signals.length > 0) {
+      lines.push("");
+      lines.push("RECENT LEARNED SIGNALS");
+      for (const signal of signals) {
+        lines.push(`- [${signal.kind || "general"}][${signal.confidence || "medium"}] ${signal.text}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  private learnPreferencesFromTurn(userMsg: string, aiRes: string) {
+    try {
+      const core = this.getNormalizedCoreIdentity();
+      const updates = this.extractDeterministicPreferenceUpdates(userMsg, aiRes);
+      if (!updates) return;
+
+      if (updates.communication) {
+        const merged = this.deepMerge(core.preferences.communication || {}, updates.communication);
+        this.db.setCoreIdentity("preferences", this.deepMerge(core.preferences, { communication: merged }));
+      }
+      if (updates.workflow) {
+        const current = this.getNormalizedCoreIdentity();
+        this.db.setCoreIdentity("preferences", this.deepMerge(current.preferences, { workflow: updates.workflow }));
+      }
+      if (updates.routines) {
+        const current = this.getNormalizedCoreIdentity();
+        this.db.setCoreIdentity("preferences", this.deepMerge(current.preferences, { routines: updates.routines }));
+      }
+      if (updates.product) {
+        const current = this.getNormalizedCoreIdentity();
+        this.db.setCoreIdentity("preferences", this.deepMerge(current.preferences, { product: updates.product }));
+      }
+      if (updates.signals.length > 0) {
+        const current = this.getNormalizedCoreIdentity();
+        const existingSignals = Array.isArray(current.preferenceSignals) ? current.preferenceSignals : [];
+        const mergedSignals = [...existingSignals, ...updates.signals].slice(-40);
+        this.db.setCoreIdentity("preferenceSignals", mergedSignals);
+      }
+    } catch (error) {
+      console.error("[Intelligence] Deterministic preference learning failed:", error);
+    }
+  }
+
+  private extractDeterministicPreferenceUpdates(userMsg: string, _aiRes: string) {
+    const text = userMsg.trim();
+    const lower = text.toLowerCase();
+    const signals: Array<Record<string, any>> = [];
+    const communication: Record<string, any> = {};
+    const workflow: Record<string, any> = {};
+    const routines: Record<string, any> = {};
+    const product: Record<string, any> = {};
+
+    const recordSignal = (kind: string, extracted: string, confidence: "high" | "medium" = "high") => {
+      signals.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind,
+        text: extracted,
+        confidence,
+        observedAt: new Date().toISOString()
+      });
+    };
+
+    if (/\b(be|keep|make it|make sure|please be)\b.*\b(concise|brief|short|direct)\b/i.test(text)) {
+      communication.verbosity = "concise";
+      recordSignal("communication", "User prefers concise, direct answers.");
+    }
+    if (/\b(in depth|detailed|thorough|deep)\b/i.test(text)) {
+      communication.depth = "detailed";
+      recordSignal("communication", "User sometimes requests detailed, in-depth output.", "medium");
+    }
+    if (/\bprofessional\b/i.test(text)) {
+      communication.tone = Array.from(new Set([...(communication.tone || []), "professional"]));
+      recordSignal("communication", "User prefers professional output style.");
+    }
+    if (/\bexecutive\b|\bchief of staff\b/i.test(text)) {
+      workflow.prioritizationStyle = "executive";
+      recordSignal("workflow", "User wants an executive or chief-of-staff style assistant.");
+    }
+    if (/\bproactive\b/i.test(text)) {
+      workflow.assistantMode = "proactive";
+      recordSignal("workflow", "User wants stronger proactive guidance.");
+    }
+    if (/\broutine|briefing|daily brief|morning briefing\b/i.test(text)) {
+      routines.prefersScheduledBriefings = true;
+      recordSignal("routines", "User values scheduled routines and briefings.", "medium");
+    }
+    if (/\breceipts|sources|source-grounded|evidence\b/i.test(text)) {
+      product.answerStyle = "evidence_first";
+      recordSignal("product", "User prefers source-grounded answers with evidence.");
+    }
+    if (/\bui\b|\bux\b|\bdashboard\b/i.test(text)) {
+      product.uiPreference = "premium_dashboard";
+      recordSignal("product", "User values polished UI and dashboard-style presentation.", "medium");
+    }
+
+    const explicitPreferenceMatch = text.match(/\b(i prefer|i like|i want|make sure|please)\b(.+)/i);
+    if (explicitPreferenceMatch) {
+      recordSignal("explicit", explicitPreferenceMatch[0].trim(), "high");
+    }
+
+    const hasUpdates = Object.keys(communication).length || Object.keys(workflow).length || Object.keys(routines).length || Object.keys(product).length || signals.length;
+    if (!hasUpdates) return null;
+    return { communication, workflow, routines, product, signals };
+  }
+
+  private deepMerge(existing: any, incoming: any): any {
+    if (Array.isArray(existing) && Array.isArray(incoming)) {
+      return Array.from(new Set([...existing, ...incoming]));
+    }
+    if (this.isPlainObject(existing) && this.isPlainObject(incoming)) {
+      const merged: Record<string, any> = { ...existing };
+      for (const [key, value] of Object.entries(incoming)) {
+        merged[key] = key in merged ? this.deepMerge(merged[key], value) : value;
+      }
+      return merged;
+    }
+    return incoming;
+  }
+
+  private isPlainObject(value: any): value is Record<string, any> {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
 }

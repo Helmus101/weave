@@ -1,6 +1,6 @@
 import type { WeaveDatabase } from "../db/client";
 import type { VectorStore } from "./vectorStore";
-import type { SearchResult, MemoryNode, MemoryLayer } from "../../shared/types";
+import type { SearchResult, MemoryNode, MemoryLayer, SourceReceipt } from "../../shared/types";
 import type { DeepSeekService } from "./deepseek";
 
 export interface SearchFilters {
@@ -23,6 +23,16 @@ export interface SearchTrace {
   expandedCandidateCount: number;
   expandedFromTitles: string[];
   goldSet: string[];
+  rawEvidenceCount?: number;
+  exactMatchCount?: number;
+  timelineExpansionCount?: number;
+  coverageSummary?: string;
+}
+
+export interface WebSearchResult {
+  title: string;
+  snippet: string;
+  url?: string;
 }
 
 export class RetrievalService {
@@ -52,7 +62,10 @@ export class RetrievalService {
       initialRankedTitles: [],
       expandedCandidateCount: 0,
       expandedFromTitles: [],
-      goldSet: []
+      goldSet: [],
+      exactMatchCount: 0,
+      timelineExpansionCount: 0,
+      coverageSummary: ""
     };
 
     onStep?.("3. Applying memory filters...");
@@ -62,7 +75,7 @@ export class RetrievalService {
     
     // Default to high-level layers to ensure we hit Episodes and Insights first
     if (!activeFilters.layers || activeFilters.layers.length === 0) {
-      activeFilters.layers = ["EPISODE", "INSIGHT", "SEMANTIC"];
+      activeFilters.layers = ["RAW", "EPISODE", "INSIGHT", "SEMANTIC"];
     }
 
     if (activeFilters.apps?.length || activeFilters.dateStart || activeFilters.layers?.length) {
@@ -90,6 +103,14 @@ export class RetrievalService {
 
       this.mergeRRF(initialCandidates, vectorRes, bm25Res);
     }
+
+    const exactMatches = this.findExactRawMatches(query, activeFilters, 25);
+    trace.exactMatchCount = exactMatches.length;
+    for (const node of exactMatches) {
+      const cur = initialCandidates.get(node.id) || { node, score: 0 };
+      cur.score += 1.5;
+      initialCandidates.set(node.id, cur);
+    }
     
     trace.initialCandidateCount = initialCandidates.size;
     onStep?.(`Found ${initialCandidates.size} initial candidates across all layers.`);
@@ -116,6 +137,17 @@ export class RetrievalService {
            expandedCandidates.set(n.id, { node: n, score: res.score * 0.5 }); // Inherit partial score
         }
       }
+      for (const raw of this.getBackingRawNodes(res.node)) {
+        if (!expandedCandidates.has(raw.id)) {
+          expandedCandidates.set(raw.id, { node: raw, score: res.score * 0.75 });
+        }
+      }
+      for (const neighbor of this.getTimelineNeighbors(res.node, activeFilters)) {
+        if (!expandedCandidates.has(neighbor.id)) {
+          expandedCandidates.set(neighbor.id, { node: neighbor, score: res.score * 0.6 });
+          trace.timelineExpansionCount = (trace.timelineExpansionCount || 0) + 1;
+        }
+      }
     }
     
     const candidatesToRerank = Array.from(expandedCandidates.values());
@@ -125,6 +157,8 @@ export class RetrievalService {
     
     const finalGoldSet = await this.rerank(query, candidatesToRerank, limit);
     trace.goldSet = finalGoldSet.map(g => g.node.title);
+    trace.rawEvidenceCount = finalGoldSet.filter((res) => res.node.layer === "RAW").length;
+    trace.coverageSummary = this.describeCoverage(finalGoldSet.map((res) => res.node));
 
     const results: SearchResult[] = finalGoldSet.map(res => ({
       nodeId: res.node.id,
@@ -223,26 +257,52 @@ Return ONLY JSON:
   }
 
   async getRecentContext(filters?: SearchFilters): Promise<string> {
-    const nodes = this.db.getMemoryNodes();
-    let recentNodes = nodes.filter(n => n.layer === "CORE" || n.layer === "INSIGHT" || n.layer === "EPISODE");
-    if (filters?.apps?.length) recentNodes = recentNodes.filter(n => filters.apps!.includes(n.metadata.app));
-    recentNodes = recentNodes.slice(0, 5);
+    const recentNodes = this.db.getMemoryNodesByFilters({
+      app: filters?.apps?.length === 1 ? filters.apps[0] : undefined,
+      dateStart: filters?.dateStart,
+      dateEnd: filters?.dateEnd,
+      layers: ["RAW", "EPISODE", "INSIGHT", "CORE"]
+    }, 5).filter((node) => !filters?.apps?.length || filters.apps.includes(String(node.metadata?.app || "")));
     const rawEvents = this.db.getRecentEvents(10);
     const filteredEvents = filters?.apps?.length ? rawEvents.filter(e => filters.apps!.some(a => e.source.toLowerCase().includes(a.toLowerCase()))) : rawEvents;
-    const rawContext = filteredEvents.map(e => `[RAW][${e.source}][${e.timestamp}] ${e.text?.slice(0, 200)}`).join("\n");
+    const rawContext = filteredEvents.map(e => `[RAW][${e.source}][${e.timestamp}] ${e.text?.slice(0, 500)}`).join("\n");
     const nodeContext = recentNodes.map(n => `[${n.layer}] ${n.title}: ${n.summary}`).join("\n");
     return `### RECENT NODES:\n${nodeContext}\n\n### MOST RECENT RAW DATA:\n${rawContext}`;
   }
 
   async performWebSearch(query: string): Promise<string> {
+    const detailed = await this.performWebSearchDetailed(query);
+    return detailed.text;
+  }
+
+  async performWebSearchDetailed(query: string): Promise<{ text: string; receipts: SourceReceipt[]; results: WebSearchResult[] }> {
     try {
       const apiRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`);
       const data: any = await apiRes.json();
       let results = `### Web Search Results for "${query}":\n`;
+      const structured: WebSearchResult[] = [];
       let found = false;
-      if (data.AbstractText) { results += `Abstract: ${data.AbstractText}\n`; found = true; }
+      if (data.AbstractText) {
+        results += `Abstract: ${data.AbstractText}\n`;
+        structured.push({
+          title: data.Heading || query,
+          snippet: data.AbstractText,
+          url: data.AbstractURL || undefined
+        });
+        found = true;
+      }
       if (data.RelatedTopics?.length > 0) {
-        data.RelatedTopics.slice(0, 5).forEach((t: any) => { if (t.Text) { results += `- ${t.Text}\n`; found = true; } });
+        data.RelatedTopics.slice(0, 5).forEach((t: any, index: number) => {
+          if (t.Text) {
+            results += `- ${t.Text}\n`;
+            structured.push({
+              title: t.FirstURL ? this.extractWebTitle(t.FirstURL) : `Result ${index + 1}`,
+              snippet: t.Text,
+              url: t.FirstURL || undefined
+            });
+            found = true;
+          }
+        });
       }
       if (!found) {
         const htmlRes = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -250,10 +310,125 @@ Return ONLY JSON:
         const snippets = html.match(/<a class="result__snippet".*?>(.*?)<\/a>/g);
         if (snippets) {
           results += "\nDeep Search:\n";
-          snippets.slice(0, 5).forEach(s => results += `- ${s.replace(/<[^>]*>/g, '').trim()}\n`);
+          snippets.slice(0, 5).forEach((s, index) => {
+            const snippet = s.replace(/<[^>]*>/g, '').trim();
+            results += `- ${snippet}\n`;
+            structured.push({
+              title: `Result ${index + 1}`,
+              snippet
+            });
+          });
         }
       }
-      return results;
-    } catch { return "Web search failed."; }
+      return {
+        text: results,
+        results: structured,
+        receipts: structured.slice(0, 5).map((item, index) => ({
+          id: `web-${index}-${item.url || item.title}`,
+          kind: "web",
+          title: item.title,
+          snippet: item.snippet.slice(0, 240),
+          url: item.url
+        }))
+      };
+    } catch {
+      return { text: "Web search failed.", receipts: [], results: [] };
+    }
+  }
+
+  buildMemoryReceipts(results: SearchResult[]): SourceReceipt[] {
+    return results.slice(0, 8).map((result, index) => {
+      const node = this.db.getMemoryNode(result.nodeId);
+      return {
+        id: `memory-${index}-${result.nodeId}`,
+        kind: "memory",
+        title: result.title,
+        snippet: String(node?.canonicalText || result.snippet || "").replace(/\s+/g, " ").slice(0, 240),
+        app: node?.metadata?.app,
+        timestamp: node?.anchorAt || node?.createdAt,
+        layer: result.layer,
+        nodeId: result.nodeId,
+        reason: result.layer === "RAW" ? "Direct raw OCR evidence" : "Higher-level memory node"
+      };
+    });
+  }
+
+  buildRawReceipts(results: SearchResult[]): SourceReceipt[] {
+    const receipts: SourceReceipt[] = [];
+    const seen = new Set<string>();
+    for (const result of results) {
+      const node = this.db.getMemoryNode(result.nodeId);
+      if (!node) continue;
+      const backingNodes = node.layer === "RAW" ? [node] : this.getBackingRawNodes(node);
+      for (const raw of backingNodes) {
+        if (seen.has(raw.id)) continue;
+        seen.add(raw.id);
+        receipts.push({
+          id: `raw-${raw.id}`,
+          kind: "event",
+          title: raw.title,
+          snippet: String(raw.canonicalText || raw.summary || "").replace(/\s+/g, " ").slice(0, 260),
+          app: raw.metadata?.app,
+          timestamp: raw.anchorAt || raw.createdAt,
+          layer: raw.layer,
+          nodeId: raw.id,
+          reason: node.layer === "RAW" ? "Matched raw capture" : `Backing evidence for ${node.title}`
+        });
+      }
+    }
+    return receipts.slice(0, 10);
+  }
+
+  private getBackingRawNodes(node: MemoryNode): MemoryNode[] {
+    const ids = Array.isArray(node.sourceRefs) ? node.sourceRefs : [];
+    const rawFromRefs = this.db.getMemoryNodesByIds(ids).filter((candidate) => candidate.layer === "RAW");
+    const edgeLinked = this.db.getMemoryEdges(node.id)
+      .filter((edge) => edge.relation === "PART_OF_EPISODE" || edge.relation === "PART_OF_SPAN")
+      .map((edge) => edge.fromId === node.id ? edge.toId : edge.fromId);
+    const rawFromEdges = this.db.getMemoryNodesByIds(edgeLinked).filter((candidate) => candidate.layer === "RAW");
+    return [...rawFromRefs, ...rawFromEdges].filter((candidate, index, arr) => arr.findIndex((item) => item.id === candidate.id) === index);
+  }
+
+  private findExactRawMatches(query: string, filters?: SearchFilters, limit = 20) {
+    return this.db.searchRawNodesExact(query, limit, {
+      apps: filters?.apps,
+      dateStart: filters?.dateStart,
+      dateEnd: filters?.dateEnd
+    });
+  }
+
+  private getTimelineNeighbors(node: MemoryNode, filters?: SearchFilters) {
+    const neighbors = new Map<string, MemoryNode>();
+    for (const candidate of this.db.getSurroundingNodes(node.id, 3)) {
+      neighbors.set(candidate.id, candidate);
+    }
+    if (node.metadata?.app && node.anchorAt) {
+      const aroundStart = new Date(new Date(node.anchorAt).getTime() - 5 * 60 * 1000).toISOString();
+      const aroundEnd = new Date(new Date(node.anchorAt).getTime() + 5 * 60 * 1000).toISOString();
+      for (const candidate of this.db.getMemoryNodesByFilters({ app: String(node.metadata.app), dateStart: aroundStart, dateEnd: aroundEnd }, 12)) {
+        if (!filters?.layers || filters.layers.includes(candidate.layer)) {
+          neighbors.set(candidate.id, candidate);
+        }
+      }
+    }
+    return [...neighbors.values()].filter((candidate) => candidate.id !== node.id);
+  }
+
+  private describeCoverage(nodes: MemoryNode[]) {
+    const layers = Array.from(new Set(nodes.map((node) => node.layer)));
+    const rawCount = nodes.filter((node) => node.layer === "RAW").length;
+    const episodeCount = nodes.filter((node) => node.layer === "EPISODE").length;
+    if (rawCount > 0 && episodeCount > 0) return `raw+episode coverage (${rawCount} raw, ${episodeCount} episode)`;
+    if (rawCount > 0) return `raw-heavy coverage (${rawCount} raw)`;
+    return `summary-led coverage (${layers.join(", ").toLowerCase()})`;
+  }
+
+  private extractWebTitle(url: string) {
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname.replace(/^www\./, "");
+    } catch {
+      return url;
+    }
   }
 }

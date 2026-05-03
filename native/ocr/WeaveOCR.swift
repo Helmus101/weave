@@ -61,34 +61,41 @@ func checkScreenPermission() -> String {
     return "unknown"
 }
 
-func captureImage(savePath: String? = nil) -> (CGImage, String?)? {
+func captureImage(savePath: String? = nil) -> (result: (CGImage, String?)?, error: String?) {
     let tempUrl = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("weave-ocr-\(UUID().uuidString).png")
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
     process.arguments = ["-x", tempUrl.path]
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
 
     do {
         try process.run()
         process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrText = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard process.terminationStatus == 0 else {
+            let message = stderrText.isEmpty ? "screencapture exited with status \(process.terminationStatus)." : stderrText
+            return (nil, message)
+        }
         
         guard let image = NSImage(contentsOf: tempUrl),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             try? FileManager.default.removeItem(at: tempUrl)
-            return nil
+            return (nil, "screencapture succeeded but the image could not be loaded.")
         }
 
         if let savePath = savePath {
             let finalUrl = URL(fileURLWithPath: savePath)
             try? FileManager.default.createDirectory(at: finalUrl.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? FileManager.default.moveItem(at: tempUrl, to: finalUrl)
-            return (cgImage, finalUrl.path)
+            return ((cgImage, finalUrl.path), nil)
         } else {
             try? FileManager.default.removeItem(at: tempUrl)
-            return (cgImage, nil)
+            return ((cgImage, nil), nil)
         }
     } catch {
-        return nil
+        return (nil, error.localizedDescription)
     }
 }
 
@@ -101,7 +108,7 @@ func recognizeText(from image: CGImage) throws -> [TextBlock] {
     try handler.perform([request])
 
     let observations = request.results ?? []
-    return observations.compactMap { observation in
+    let blocks: [TextBlock] = observations.compactMap { observation in
         guard let candidate = observation.topCandidates(1).first else { return nil }
         let box = observation.boundingBox
         return TextBlock(
@@ -114,6 +121,14 @@ func recognizeText(from image: CGImage) throws -> [TextBlock] {
                 height: Double(box.size.height)
             )
         )
+    }
+    return blocks.sorted { lhs, rhs in
+        let lhsMidY = lhs.bounds.y + (lhs.bounds.height / 2.0)
+        let rhsMidY = rhs.bounds.y + (rhs.bounds.height / 2.0)
+        if abs(lhsMidY - rhsMidY) > 0.03 {
+            return lhsMidY > rhsMidY
+        }
+        return lhs.bounds.x < rhs.bounds.x
     }
 }
 
@@ -171,7 +186,9 @@ guard permission == "granted" else {
     exit(0)
 }
 
-guard let captureResult = captureImage(savePath: savePath) else {
+let captureResult = captureImage(savePath: savePath)
+guard let (image, finalScreenshotPath) = captureResult.result else {
+    let errorMessage = captureResult.error ?? "Unable to capture the screen."
     emit(CaptureResponse(
         ok: false,
         text: "",
@@ -181,14 +198,11 @@ guard let captureResult = captureImage(savePath: savePath) else {
         activeBundleId: frontmost?.bundleIdentifier,
         activeWindowTitle: activeWindowTitle(),
         permission: permission,
-        error: "Unable to capture the screen.",
+        error: errorMessage,
         screenshotPath: nil
     ))
     exit(0)
 }
-
-let image = captureResult.0
-let finalScreenshotPath = captureResult.1
 
 do {
     let blocks = try recognizeText(from: image)

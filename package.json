@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Local-first relationship intelligence engine for macOS.",
+  "author": "Weave",
   "main": "dist/main/main/index.js",
   "type": "commonjs",
   "scripts": {
@@ -10,15 +11,21 @@
     "dev:main": "tsc -p tsconfig.main.json --watch --preserveWatchOutput",
     "dev:preload": "tsc -p tsconfig.preload.json --watch --preserveWatchOutput",
     "dev:electron": "concurrently -k \"npm:dev\" \"npm:dev:main\" \"npm:dev:preload\" \"wait-on http://127.0.0.1:5173 dist/main/main/index.js dist/preload/preload/index.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "mcp": "npm run build:main && node scripts/weave-mcp-server.cjs",
+    "mcp:http": "npm run build:main && node scripts/weave-mcp-server.cjs --http",
     "build": "tsc -p tsconfig.json && vite build && npm run build:main && npm run build:preload",
     "build:main": "tsc -p tsconfig.main.json",
     "build:preload": "tsc -p tsconfig.preload.json",
     "build:ocr": "swiftc native/ocr/WeaveOCR.swift -framework AppKit -framework Vision -framework CoreGraphics -o native/ocr/weave-ocr",
     "build:contacts": "swiftc src/main/scripts/fetch_apple_contacts.swift -framework Contacts -framework Foundation -o src/main/scripts/fetch_apple_contacts",
+    "build:electron": "node scripts/clean-release.js && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config electron-builder.json --mac dmg --publish=never",
+    "dmg": "npm run build:ocr && npm run build:contacts && npm run build:electron",
+    "beta:check": "npm run typecheck && npm test && npm run build && npm run build:ocr && npm run build:contacts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.main.json && tsc --noEmit -p tsconfig.preload.json"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@supabase/supabase-js": "^2.43.2",
     "clsx": "^2.1.1",
     "drizzle-orm": "^0.30.10",
@@ -28,7 +35,6 @@
     "react-dom": "^18.2.0",
     "sql.js": "^1.10.3",
     "zod": "^3.22.4"
-
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
@@ -39,6 +45,7 @@
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
     "electron": "^29.1.6",
+    "electron-builder": "^26.8.1",
     "typescript": "^5.4.3",
     "vite": "^5.2.6",
     "vitest": "^1.4.0",

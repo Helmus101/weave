@@ -1,10 +1,59 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { IPC } from "../shared/ipc";
 import type { CaptureState, ChatMessage, MemoryLayer, WeaveApi, AppSettings } from "../shared/types";
 
-console.log("Preload script starting...");
+// Sandboxed Electron preload scripts cannot depend on arbitrary local runtime imports.
+// Keep the IPC channel map local so the bridge can still load with sandbox enabled.
+const IPC = {
+  appStatus: "app:status",
+  captureState: "capture:state",
+  captureSetEnabled: "capture:set-enabled",
+  captureRunNow: "capture:run-now",
+  captureStateChanged: "capture:state-changed",
+  search: "search:query",
+  chatSessionCreate: "chat:session-create",
+  chatSessionsGet: "chat:sessions-get",
+  chatMessagesGet: "chat:messages-get",
+  chatMessageSend: "chat:message-send",
+  chatDeleteSession: "chat:delete-session",
+  chatMessageReceived: "chat:message-received",
+  chatThinkingStep: "chat:thinking-step",
+  proactiveSuggestions: "proactive:suggestions",
+  proactiveGenerationState: "proactive:generation-state",
+  proactiveSuggestionsGenerate: "proactive:suggestions-generate",
+  proactiveSuggestionsSet: "proactive:suggestions-set",
+  proactiveTaskDetail: "proactive:task-detail",
+  routinesTemplatesGet: "routines:templates-get",
+  routinesGet: "routines:get",
+  routinesSave: "routines:save",
+  routinesDelete: "routines:delete",
+  routinesRunNow: "routines:run-now",
+  routinesRunsGet: "routines:runs-get",
+  routinesRunGet: "routines:run-get",
+  memoryNodesGet: "memory:nodes-get",
+  memoryNodeDetails: "memory:node-details",
+  memoryUpdateMetadata: "memory:update-metadata",
+  memorySynthesizeEpisodes: "memory:synthesize-episodes",
+  settingsGet: "settings:get",
+  settingsUpdate: "settings:update",
+  settingsDeleteAllData: "settings:delete-all-data",
+  googleStatus: "google:status",
+  googleStartAuth: "google:start-auth",
+  googleFinishAuth: "google:finish-auth",
+  googleSetTokens: "google:set-tokens",
+  googleSync: "google:sync",
+  appleContactsSync: "apple-contacts:sync",
+  syncProgress: "sync:progress",
+  openScreenshotsFolder: "open-screenshots-folder",
+  authOpenSession: "auth:open-session",
+  switchAccount: "switch-account",
+  quickChatSetMode: "quick-chat:set-mode",
+  quickChatClose: "quick-chat:close",
+  permissionsGet: "permissions:get",
+  permissionsOpen: "permissions:open"
+} as const;
 
 const api: WeaveApi = {
+  getBridgeStatus: () => ipcRenderer.invoke(IPC.appStatus),
   getCaptureState: () => ipcRenderer.invoke(IPC.captureState),
   setCaptureEnabled: (enabled: boolean) => ipcRenderer.invoke(IPC.captureSetEnabled, enabled),
   runCaptureNow: () => ipcRenderer.invoke(IPC.captureRunNow),
@@ -20,6 +69,12 @@ const api: WeaveApi = {
   finishGoogleAuth: (code: string) => ipcRenderer.invoke(IPC.googleFinishAuth, code),
   setGoogleTokens: (tokens: any) => ipcRenderer.invoke(IPC.googleSetTokens, tokens),
   syncGoogle: () => ipcRenderer.invoke(IPC.googleSync),
+  switchAccount: (userId: string) => ipcRenderer.invoke(IPC.switchAccount, userId),
+  openAuthSession: (authUrl: string, callbackUrlPrefix: string) => ipcRenderer.invoke(IPC.authOpenSession, authUrl, callbackUrlPrefix),
+  getPermissions: () => ipcRenderer.invoke(IPC.permissionsGet),
+  openPermission: (pane: string) => ipcRenderer.invoke(IPC.permissionsOpen, pane),
+  setQuickChatMode: (mode: "compact" | "expanded") => ipcRenderer.invoke(IPC.quickChatSetMode, mode),
+  closeQuickChat: () => ipcRenderer.invoke(IPC.quickChatClose),
 
   syncAppleContacts: () => ipcRenderer.invoke(IPC.appleContactsSync),
   openScreenshotsFolder: () => ipcRenderer.invoke(IPC.openScreenshotsFolder),
@@ -41,6 +96,15 @@ const api: WeaveApi = {
   getProactiveSuggestions: () => ipcRenderer.invoke(IPC.proactiveSuggestions),
   generateProactiveSuggestions: () => ipcRenderer.invoke(IPC.proactiveSuggestionsGenerate),
   setProactiveSuggestions: (suggestions: any[]) => ipcRenderer.invoke(IPC.proactiveSuggestionsSet, suggestions),
+  getProactiveTaskDetail: (summary: string, plan?: string, evidence?: string) =>
+    ipcRenderer.invoke(IPC.proactiveTaskDetail, summary, plan, evidence),
+  getRoutineTemplates: () => ipcRenderer.invoke(IPC.routinesTemplatesGet),
+  getRoutines: () => ipcRenderer.invoke(IPC.routinesGet),
+  saveRoutine: (routine: any) => ipcRenderer.invoke(IPC.routinesSave, routine),
+  deleteRoutine: (id: string) => ipcRenderer.invoke(IPC.routinesDelete, id),
+  runRoutineNow: (id: string) => ipcRenderer.invoke(IPC.routinesRunNow, id),
+  getRoutineRuns: (routineId?: string) => ipcRenderer.invoke(IPC.routinesRunsGet, routineId),
+  getRoutineRun: (id: string) => ipcRenderer.invoke(IPC.routinesRunGet, id),
 
   onCaptureState: (listener: (state: CaptureState) => void) => {
     const wrapped = (_event: any, state: CaptureState) => listener(state);
@@ -76,7 +140,6 @@ const api: WeaveApi = {
 
 try {
   contextBridge.exposeInMainWorld("weave", api);
-  console.log("Preload script: weave API exposed successfully");
-} catch (e) {
-  console.error("Preload script: Failed to expose weave API", e);
+} catch (error) {
+  console.error("[Preload] Failed to expose weave bridge:", error);
 }

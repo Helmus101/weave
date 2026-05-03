@@ -19,6 +19,9 @@ export function redactForCloud(text: string) {
     redactedText = redactedText.split(original).join(placeholder);
   }
 
+  redactedText = redactedText.replace(/\b(password|passcode|secret)\s*:\s*\S+/gi, (_match, label: string) => `${label}: [SECRET]`);
+  redactedText = redactedText.replace(/\b(?:\d[ -]*?){13,19}\b/g, "[PAYMENT_CARD]");
+
   return {
     redactedText,
     entities,

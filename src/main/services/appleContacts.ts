@@ -1,36 +1,65 @@
 import { execFile } from "node:child_process";
-import path from "node:path";
 import util from "node:util";
+import fs from "node:fs";
 import type { WeaveDatabase } from "../db/client";
 import type { IdentityService } from "./identity";
 
 const execFileAsync = util.promisify(execFile);
 
 export class AppleContactService {
-  constructor(private db: WeaveDatabase, private identity: IdentityService) {}
+  constructor(
+    private db: WeaveDatabase,
+    private identity: IdentityService,
+    private binaryPath: string
+  ) {}
   private isSyncing = false;
+  private stopped = false;
+  private syncGeneration = 0;
 
   private onProgress?: (progress: any) => void;
   setProgressListener(cb: (progress: any) => void) {
     this.onProgress = cb;
   }
 
+  stop() {
+    this.stopped = true;
+    this.syncGeneration += 1;
+  }
+
+  async getPermissionStatus(): Promise<"granted" | "denied" | "unknown"> {
+    try {
+      if (!fs.existsSync(this.binaryPath)) {
+        return "unknown";
+      }
+      await execFileAsync(this.binaryPath);
+      return "granted";
+    } catch (error: any) {
+      const message = String(error?.message || error || "").toLowerCase();
+      if (message.includes("permission denied") || message.includes("operation not permitted")) {
+        return "denied";
+      }
+      return "unknown";
+    }
+  }
+
   async sync() {
+    if (this.stopped) return;
     if (this.isSyncing) {
       console.log("[AppleContacts] Sync skipped because another sync is already running.");
       return;
     }
     this.isSyncing = true;
+    const generation = ++this.syncGeneration;
     this.onProgress?.({ service: "apple", status: "syncing", processed: 0, total: 100 });
     console.log("[AppleContacts] Starting local sync...");
-    const { app } = require("electron");
-    const scriptPath = app.isPackaged 
-      ? path.join((process as any).resourcesPath, "fetch_apple_contacts")
-      : path.join(app.getAppPath(), "src/main/scripts/fetch_apple_contacts");
 
     
     try {
-      const { stdout } = await execFileAsync(scriptPath);
+      if (!fs.existsSync(this.binaryPath)) {
+        throw new Error("Apple Contacts bridge is not built. Run npm run build:contacts.");
+      }
+      const { stdout } = await execFileAsync(this.binaryPath);
+      if (this.stopped || generation !== this.syncGeneration) return;
       const contacts = JSON.parse(stdout);
       const existingContactKeys = this.buildExistingContactKeySet();
       
@@ -38,6 +67,7 @@ export class AppleContactService {
       let processed = 0;
       const createdRawNodes: any[] = [];
       for (const contact of contacts) {
+        if (this.stopped || generation !== this.syncGeneration) return;
         processed++;
         if (!contact.name) continue;
         
@@ -85,12 +115,23 @@ export class AppleContactService {
         }
       }
       
+      if (this.stopped || generation !== this.syncGeneration) return;
       console.log(`[AppleContacts] Synced ${contacts.length} contacts.`);
       
       this.identity.processNewContacts(createdRawNodes);
+      this.db.setSubsystemHealth("appleContacts", {
+        lastSuccessAt: new Date().toISOString(),
+        lastFailureAt: undefined,
+        lastFailureMessage: undefined
+      });
       
       this.onProgress?.({ service: "apple", status: "completed", processed: 100, total: 100 });
     } catch (e: any) {
+      if (this.stopped || generation !== this.syncGeneration) return;
+      this.db.setSubsystemHealth("appleContacts", {
+        lastFailureAt: new Date().toISOString(),
+        lastFailureMessage: e.message
+      });
       this.onProgress?.({ service: "apple", status: "error", processed: 0, error: e.message });
       const isPermissionError = e.message.includes("Permission denied") || e.message.includes("Operation not permitted");
       const helpfulError = isPermissionError 
@@ -98,7 +139,6 @@ export class AppleContactService {
         : e.message;
       console.error("[AppleContacts] Sync failed:", helpfulError);
     } finally {
-
       this.isSyncing = false;
     }
   }

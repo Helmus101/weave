@@ -1,4 +1,5 @@
 export const IPC = {
+  appStatus: "app:status",
   captureState: "capture:state",
   captureSetEnabled: "capture:set-enabled",
   captureRunNow: "capture:run-now",
@@ -17,6 +18,14 @@ export const IPC = {
   proactiveGenerationState: "proactive:generation-state",
   proactiveSuggestionsGenerate: "proactive:suggestions-generate",
   proactiveSuggestionsSet: "proactive:suggestions-set",
+  proactiveTaskDetail: "proactive:task-detail",
+  routinesTemplatesGet: "routines:templates-get",
+  routinesGet: "routines:get",
+  routinesSave: "routines:save",
+  routinesDelete: "routines:delete",
+  routinesRunNow: "routines:run-now",
+  routinesRunsGet: "routines:runs-get",
+  routinesRunGet: "routines:run-get",
 
   memoryNodesGet: "memory:nodes-get",
   memoryNodeDetails: "memory:node-details",
@@ -37,6 +46,10 @@ export const IPC = {
   syncProgress: "sync:progress",
   
   openScreenshotsFolder: "open-screenshots-folder",
-  switchAccount: "switch-account"
+  authOpenSession: "auth:open-session",
+  switchAccount: "switch-account",
+  quickChatSetMode: "quick-chat:set-mode",
+  quickChatClose: "quick-chat:close",
+  permissionsGet: "permissions:get",
+  permissionsOpen: "permissions:open"
 } as const;
-
